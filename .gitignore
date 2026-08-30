@@ -1,0 +1,5 @@
+/target
+.harness/
+.env
+*.log
+.DS_Store
