@@ -1,4 +1,3 @@
-use anyhow::Result;
 
 pub struct SecurityManager {
     pub require_approval_for_write: bool,

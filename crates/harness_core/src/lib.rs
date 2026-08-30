@@ -4,4 +4,7 @@ pub mod tools;
 
 pub use context_manager::ContextManager;
 pub use tool_registry::{HarnessToolRegistry, Tool};
-pub use tools::{BashCommandTool, ListDirTool, ReadFileTool, WriteFileTool};
+pub use tools::{
+    BashCommandTool, EditFileBlockTool, FindFilesByNameTool, GrepSearchTool, ListDirTool,
+    ReadFileTool, WriteFileTool,
+};

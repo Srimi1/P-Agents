@@ -136,3 +136,28 @@ impl Tool for ListDirTool {
         Ok(entries.join("\n"))
     }
 }
+
+pub struct EditFileBlockTool;
+
+#[async_trait]
+impl Tool for EditFileBlockTool {
+    fn name(&self) -> &str {
+        "edit_file_block"
+    }
+
+    fn description(&self) -> &str {
+        "Replaces an exact block of text inside a file."
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<String> {
+        anyhow::bail!("edit_file_block not implemented yet")
+    }
+}

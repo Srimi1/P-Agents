@@ -49,7 +49,7 @@ impl ToolDispatcher for HarnessToolRegistry {
             .collect()
     }
 
-    async fn dispatch(&self, tool_call: &ToolCall) -> Result<String> {
+    async fn dispatch(&self, _agent_id: &str, tool_call: &ToolCall) -> Result<String> {
         let tool = self
             .tools
             .get(&tool_call.name)
