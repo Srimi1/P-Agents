@@ -1,4 +1,7 @@
-# Universal Multi-Agent Harness (Rust)
+# P-Agents — Universal Multi-Agent Harness (Rust)
+
+> Creating and learning to create agents and subagents in a harness, step by step.
+> Be ready to watch my journey.
 
 A model-agnostic AI agent harness and multi-agent orchestrator built on `tokio`.
 One static binary: streaming ReAct loop, isolated sub-agents, gated tool
