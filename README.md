@@ -1,5 +1,8 @@
 # P-Agents — Universal Multi-Agent Harness (Rust)
 
+[![CI](https://github.com/Srimi1/P-Agents/actions/workflows/ci.yml/badge.svg)](https://github.com/Srimi1/P-Agents/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > Creating and learning to create agents and subagents in a harness, step by step.
 > Be ready to watch my journey.
 
@@ -226,9 +229,11 @@ Worth knowing before you point this at something important.
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+cargo fmt --all --check
 ./scripts/e2e.sh
 ```
+
+CI runs all of the above on Linux and macOS for every push and pull request.
 
 `scripts/e2e.sh` runs the full gate: build, tests, clippy, an offline one-shot
 run that asserts the artifact and session log, and a scripted REPL session that
