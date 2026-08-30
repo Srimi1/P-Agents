@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use harness_core::HarnessToolRegistry;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct GatedDispatcher {
     inner: Arc<HarnessToolRegistry>,
@@ -42,9 +42,9 @@ impl GatedDispatcher {
         self
     }
 
-    pub fn registry(&self) -> Arc<HarnessToolRegistry> {
-        self.inner.clone()
-    }
+    // Deliberately no accessor for the inner registry. `HarnessToolRegistry` is
+    // itself a `ToolDispatcher`, so handing it out would let any holder of a
+    // gated dispatcher obtain an ungated one and skip approval entirely.
 }
 
 fn denied_observation(tool: &str) -> String {
@@ -82,6 +82,18 @@ impl ToolDispatcher for GatedDispatcher {
                 .gate
                 .request(agent_id, &tool_call.name, &tool_call.arguments)
                 .await?;
+
+            if decision == ApprovalDecision::Deny {
+                // Info, not warn: a denial is the user exercising the gate, and
+                // the REPL shows warnings by default.
+                info!(agent = agent_id, tool = %tool_call.name, "Tool call denied by user");
+                // An Ok observation, not an Err: the ReAct loop feeds it back to
+                // the model, which then adapts instead of surfacing a failure.
+                return Ok(denied_observation(&tool_call.name));
+            }
+            // Only announce execution once the call is actually going to run;
+            // a denial leaves the agent in WaitingForApproval for agent.rs to
+            // move on from, rather than claiming a tool ran that never did.
             emit(
                 &self.events,
                 AgentEvent::StateChanged {
@@ -89,13 +101,6 @@ impl ToolDispatcher for GatedDispatcher {
                     state: AgentState::ExecutingTool,
                 },
             );
-
-            if decision == ApprovalDecision::Deny {
-                warn!(agent = agent_id, tool = %tool_call.name, "Tool call denied by user");
-                // An Ok observation, not an Err: the ReAct loop feeds it back to
-                // the model, which then adapts instead of surfacing a failure.
-                return Ok(denied_observation(&tool_call.name));
-            }
             info!(agent = agent_id, tool = %tool_call.name, ?decision, "Tool call approved");
         }
 
@@ -361,6 +366,9 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["read_file", "run_bash_command"]);
-        assert!(dispatcher.registry().get_tool("read_file").is_some());
+        assert!(dispatcher
+            .get_definitions()
+            .iter()
+            .any(|d| d.name == "read_file"));
     }
 }

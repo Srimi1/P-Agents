@@ -120,15 +120,18 @@ impl TokenUsage {
         Self {
             prompt_tokens,
             completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
         }
     }
 
-    /// Folds another turn's usage into this running total.
+    /// Folds another turn's usage into this running total. Counts come from a
+    /// remote server, so they are saturated rather than trusted not to overflow.
     pub fn accumulate(&mut self, other: &TokenUsage) {
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.total_tokens += other.total_tokens;
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
     }
 }
 
@@ -188,6 +191,17 @@ mod tests {
     #[test]
     fn truncate_can_return_empty() {
         assert_eq!(truncate_at_boundary("日", 1), "");
+    }
+
+    #[test]
+    fn usage_saturates_instead_of_overflowing() {
+        // Providers are remote; absurd counts must not panic the stream task.
+        let huge = TokenUsage::new(usize::MAX, usize::MAX);
+        assert_eq!(huge.total_tokens, usize::MAX);
+
+        let mut running = TokenUsage::new(usize::MAX, 0);
+        running.accumulate(&TokenUsage::new(usize::MAX, 0));
+        assert_eq!(running.prompt_tokens, usize::MAX);
     }
 
     #[test]

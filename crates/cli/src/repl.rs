@@ -17,8 +17,57 @@ use tokio::sync::Mutex as AsyncMutex;
 /// the answer can overtake the last tool line.
 const RENDER_SETTLE: Duration = Duration::from_millis(60);
 
+/// Ceiling on how long a turn waits for the renderer to catch up. Only reached
+/// if the renderer has died, in which case the REPL carries on regardless.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Not a real agent. A state change stamped with this id is pushed through the
+/// event pipeline after each turn; because the channel and the bus are both
+/// FIFO, seeing it means everything the turn produced has already been drawn.
+const SYNC_AGENT_ID: &str = "__repl_sync__";
+
 type Lines = Arc<AsyncMutex<mpsc::UnboundedReceiver<String>>>;
 type UsageTable = Arc<Mutex<HashMap<String, TokenUsage>>>;
+
+/// Shared with the renderer so it knows whose tokens to print as the primary
+/// stream. Everyone else is dimmed and prefixed with their agent id.
+#[derive(Clone)]
+struct Focus {
+    agent_id: Arc<Mutex<String>>,
+    /// Whether the focused agent has streamed any text this turn. When it has,
+    /// the REPL must not print the answer again underneath it.
+    streamed: Arc<std::sync::atomic::AtomicBool>,
+    sync: Arc<tokio::sync::Notify>,
+}
+
+impl Focus {
+    fn new() -> Self {
+        Self {
+            agent_id: Arc::new(Mutex::new(LEAD_AGENT_ID.to_string())),
+            streamed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn begin_turn(&self, agent_id: &str) {
+        *self.agent_id.lock().unwrap_or_else(|p| p.into_inner()) = agent_id.to_string();
+        self.streamed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_focused(&self, agent_id: &str) -> bool {
+        *self.agent_id.lock().unwrap_or_else(|p| p.into_inner()) == agent_id
+    }
+
+    fn mark_streamed(&self) {
+        self.streamed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn did_stream(&self) -> bool {
+        self.streamed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 pub async fn start_repl(
     mut app: HarnessApp,
@@ -28,12 +77,15 @@ pub async fn start_repl(
 
     let lines = spawn_stdin_reader();
     let usage: UsageTable = Arc::new(Mutex::new(HashMap::new()));
+    let focus = Focus::new();
     let renderer = tokio::spawn(render_loop(
         app.runtime.subscribe(),
         approvals,
         Arc::clone(&lines),
         Arc::clone(&usage),
+        focus.clone(),
     ));
+    let sink = app.runtime.event_sink();
 
     loop {
         print!("\n{} ", "harness>".bold().blue());
@@ -91,15 +143,21 @@ pub async fn start_repl(
                     },
                 };
                 announce(&role);
-                match app.run_persona_once(&role, &subject).await {
-                    Ok(answer) => finish(&answer),
+                focus.begin_turn(&format!("{role}-oneshot"));
+                let result = app.run_persona_once(&role, &subject).await;
+                sync_renderer(&sink, &focus).await;
+                match result {
+                    Ok(answer) => finish(&answer, &focus),
                     Err(err) => println!("\n{} {}", "error:".bold().red(), err),
                 }
             }
             Command::Prompt(text) => {
                 announce("lead planner");
-                match app.run_prompt(&text).await {
-                    Ok(answer) => finish(&answer),
+                focus.begin_turn(LEAD_AGENT_ID);
+                let result = app.run_prompt(&text).await;
+                sync_renderer(&sink, &focus).await;
+                match result {
+                    Ok(answer) => finish(&answer, &focus),
                     Err(err) => println!("\n{} {}", "error:".bold().red(), err),
                 }
             }
@@ -137,8 +195,33 @@ fn announce(who: &str) {
     println!("\n{}", format!("▸ {who} working…").italic().magenta());
 }
 
-fn finish(answer: &str) {
-    println!("\n{}\n{}", "◆ Final answer".bold().green(), answer);
+/// Closes out a turn. When the focused agent already streamed its answer to the
+/// screen, repeating it here would show it twice, so only a rule is drawn.
+fn finish(answer: &str, focus: &Focus) {
+    if focus.did_stream() {
+        println!("\n{}", "─".repeat(60).dimmed());
+    } else {
+        println!("\n{}\n{}", "◆ Final answer".bold().green(), answer);
+    }
+}
+
+/// Pushes a sentinel through the event pipeline and waits for the renderer to
+/// draw it, so the turn's output is on screen before the prompt returns.
+async fn sync_renderer(sink: &agent_core::EventSink, focus: &Focus) {
+    let notified = focus.sync.notified();
+    let sent = sink
+        .send(agent_core::AgentEvent::StateChanged {
+            agent_id: SYNC_AGENT_ID.to_string(),
+            state: agent_core::AgentState::Idle,
+        })
+        .is_ok();
+
+    if sent && tokio::time::timeout(SYNC_TIMEOUT, notified).await.is_ok() {
+        return;
+    }
+    // No renderer, or it never acknowledged: fall back to a short grace period
+    // rather than blocking the REPL.
+    tokio::time::sleep(RENDER_SETTLE).await;
 }
 
 // ---------------------------------------------------------------- commands
@@ -308,8 +391,8 @@ async fn read_line(lines: &Lines) -> Option<String> {
 
 #[derive(Default)]
 struct Renderer {
-    /// Partial lines for sub-agents, which are buffered so their output never
-    /// interleaves mid-word with the lead's stream.
+    /// Partial lines for background agents, buffered so their output never
+    /// interleaves mid-word with the focused agent's stream.
     sub_buffers: HashMap<String, String>,
     lead_mid_line: bool,
     spinner: Option<ProgressBar>,
@@ -328,6 +411,13 @@ impl Renderer {
         if self.lead_mid_line {
             println!();
             self.lead_mid_line = false;
+        }
+    }
+
+    fn flush_all_subs(&mut self) {
+        let ids: Vec<String> = self.sub_buffers.keys().cloned().collect();
+        for id in ids {
+            self.flush_sub(&id);
         }
     }
 
@@ -351,42 +441,61 @@ async fn render_loop(
     mut approvals: mpsc::Receiver<ApprovalRequest>,
     lines: Lines,
     usage: UsageTable,
+    focus: Focus,
 ) {
     let mut renderer = Renderer::default();
 
     loop {
-        tokio::select! {
+        let pending = tokio::select! {
             // Approvals win: an agent is blocked waiting on the answer.
             biased;
 
-            request = approvals.recv() => {
-                let Some(request) = request else { continue };
-                renderer.break_line();
-                let decision = prompt_for_approval(&request, &lines).await;
-                let _ = request.respond.send(decision);
-            }
+            request = approvals.recv() => request,
             event = bus.recv() => {
                 match event {
-                    Ok(event) => handle_event(event, &mut renderer, &usage),
+                    Ok(event) => handle_event(event, &mut renderer, &usage, &focus),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         renderer.break_line();
                         println!("  {}", format!("… {n} events skipped (renderer fell behind)").dimmed());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                None
             }
+        };
+
+        let Some(request) = pending else { continue };
+
+        // Draw whatever is already queued before asking. Consent is meaningless
+        // if the tool call that prompted it has not appeared on screen yet.
+        while let Ok(event) = bus.try_recv() {
+            handle_event(event, &mut renderer, &usage, &focus);
         }
+        renderer.break_line();
+        let decision = prompt_for_approval(&request, &lines).await;
+        let _ = request.respond.send(decision);
     }
 }
 
-fn handle_event(event: HarnessEvent, renderer: &mut Renderer, usage: &UsageTable) {
+fn handle_event(event: HarnessEvent, renderer: &mut Renderer, usage: &UsageTable, focus: &Focus) {
+    // The turn-boundary sentinel: everything queued ahead of it is now drawn.
+    if event_agent_id(&event) == Some(SYNC_AGENT_ID) {
+        renderer.flush_all_subs();
+        renderer.break_line();
+        focus.sync.notify_one();
+        return;
+    }
+
     match event {
         HarnessEvent::TextDelta { agent_id, delta } => {
-            if agent_id == LEAD_AGENT_ID {
+            if focus.is_focused(&agent_id) {
                 renderer.clear_spinner();
                 print!("{delta}");
                 let _ = io::stdout().flush();
                 renderer.lead_mid_line = !delta.ends_with('\n');
+                if !delta.trim().is_empty() {
+                    focus.mark_streamed();
+                }
             } else {
                 let buffer = renderer.sub_buffers.entry(agent_id.clone()).or_default();
                 buffer.push_str(&delta);
@@ -406,11 +515,7 @@ fn handle_event(event: HarnessEvent, renderer: &mut Renderer, usage: &UsageTable
             arguments,
         } => {
             renderer.break_line();
-            let who = if agent_id == LEAD_AGENT_ID {
-                String::new()
-            } else {
-                format!("[{agent_id}] ")
-            };
+            let who = agent_label(&agent_id, focus);
             let spinner = ProgressBar::new_spinner();
             spinner.set_style(
                 ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -432,12 +537,17 @@ fn handle_event(event: HarnessEvent, renderer: &mut Renderer, usage: &UsageTable
             is_error,
         } => {
             renderer.clear_spinner();
-            let mark = if is_error { "✗".red() } else { "✓".green() };
-            let who = if agent_id == LEAD_AGENT_ID {
-                String::new()
+            // A denial comes back as a successful observation, but showing it
+            // with a green tick would read as "the tool ran".
+            let denied = preview.starts_with("DENIED by user");
+            let mark = if is_error {
+                "✗".red()
+            } else if denied {
+                "⊘".yellow()
             } else {
-                format!("[{agent_id}] ")
+                "✓".green()
             };
+            let who = agent_label(&agent_id, focus);
             let first_line = preview.lines().next().unwrap_or("").trim();
             println!("  {} {}{} {}", mark, who, tool.bold(), first_line.dimmed());
         }
@@ -478,9 +588,31 @@ fn handle_event(event: HarnessEvent, renderer: &mut Renderer, usage: &UsageTable
                     .dimmed()
             );
         }
-        HarnessEvent::StateChanged { .. }
-        | HarnessEvent::MessageAppended { .. }
-        | HarnessEvent::ApprovalRequested { .. } => {}
+        HarnessEvent::StateChanged { .. } | HarnessEvent::MessageAppended { .. } => {}
+    }
+}
+
+/// Background agents are labelled; the focused agent's own lines are not, since
+/// its output is the main stream the user is reading.
+fn agent_label(agent_id: &str, focus: &Focus) -> String {
+    if focus.is_focused(agent_id) {
+        String::new()
+    } else {
+        format!("[{agent_id}] ")
+    }
+}
+
+fn event_agent_id(event: &HarnessEvent) -> Option<&str> {
+    match event {
+        HarnessEvent::StateChanged { agent_id, .. }
+        | HarnessEvent::TextDelta { agent_id, .. }
+        | HarnessEvent::MessageAppended { agent_id, .. }
+        | HarnessEvent::ToolStarted { agent_id, .. }
+        | HarnessEvent::ToolFinished { agent_id, .. }
+        | HarnessEvent::UsageReport { agent_id, .. }
+        | HarnessEvent::SubAgentSpawned { agent_id, .. }
+        | HarnessEvent::SubAgentFinished { agent_id, .. }
+        | HarnessEvent::Compacted { agent_id, .. } => Some(agent_id),
     }
 }
 
@@ -524,17 +656,13 @@ async fn prompt_for_approval(request: &ApprovalRequest, lines: &Lines) -> Approv
     println!("{}", rule.yellow());
     print!(
         "{} ",
-        "allow? [y]es / [n]o / [a]lways for this session:".bold()
+        "allow? [y]es / [n]o / [a]lways (this tool, any agent, rest of session):".bold()
     );
     let _ = io::stdout().flush();
 
-    // Stale type-ahead typed before the prompt appeared must not be mistaken
-    // for an answer to it.
-    {
-        let mut rx = lines.lock().await;
-        while rx.try_recv().is_ok() {}
-    }
-
+    // Deliberately no "discard type-ahead" step here. Draining buffered lines
+    // would swallow the answer whenever input arrives faster than the prompt is
+    // drawn, which is always the case for piped input.
     match read_line(lines).await {
         Some(answer) => match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => ApprovalDecision::Approve,

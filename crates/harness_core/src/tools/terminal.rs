@@ -41,8 +41,18 @@ pub async fn kill_background_job(pid: u32) -> Result<bool> {
 }
 
 /// Pids of the background jobs this process started, in unspecified order.
+/// Finished jobs are reaped first, so this reflects what is still running.
 pub fn background_job_pids() -> Vec<u32> {
-    background_jobs().keys().copied().collect()
+    let mut jobs = background_jobs();
+    reap_finished(&mut jobs);
+    jobs.keys().copied().collect()
+}
+
+/// Drops children that have already exited. Without this the map grows without
+/// bound and every finished job stays a zombie holding its pid, because nothing
+/// ever waits on a background `Child`.
+fn reap_finished(jobs: &mut HashMap<u32, Child>) {
+    jobs.retain(|_, child| !matches!(child.try_wait(), Ok(Some(_))));
 }
 
 pub struct BashCommandTool;
@@ -151,7 +161,11 @@ fn run_background(command_str: &str, cwd: &str) -> Result<String> {
         None => anyhow::bail!("Background command exited before a pid could be observed"),
     };
 
-    background_jobs().insert(pid, child);
+    {
+        let mut jobs = background_jobs();
+        reap_finished(&mut jobs);
+        jobs.insert(pid, child);
+    }
 
     Ok(format!(
         "Started background process with pid {}. Its output is not captured; redirect it to a file in the command if you need it, and check on the process with `ps -p {}`.\n",

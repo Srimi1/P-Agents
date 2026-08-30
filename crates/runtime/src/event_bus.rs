@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-/// Mirrors `AgentEvent` one-for-one, plus the approval prompt, which
-/// originates in the runtime rather than inside an agent.
+/// Mirrors `AgentEvent` one-for-one.
+///
+/// Approval requests deliberately do not travel on this bus: they need a reply,
+/// so they go to exactly one responder over `ApprovalGate`'s channel rather than
+/// being broadcast to every subscriber.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HarnessEvent {
     StateChanged {
@@ -52,12 +55,6 @@ pub enum HarnessEvent {
         agent_id: String,
         messages_before: usize,
         messages_after: usize,
-    },
-    ApprovalRequested {
-        request_id: String,
-        agent_id: String,
-        tool: String,
-        arguments: Value,
     },
 }
 

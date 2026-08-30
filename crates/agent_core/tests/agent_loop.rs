@@ -890,3 +890,98 @@ async fn restore_history_keeps_an_existing_system_prompt() {
         Some("persisted prompt")
     );
 }
+
+#[tokio::test]
+async fn an_empty_prompt_is_refused_before_any_provider_call() {
+    // Anthropic drops a blank user turn and then rejects the request for having
+    // no messages, while OpenAI accepts it. The loop refuses so both behave alike.
+    let provider = Arc::new(MockProvider::with_text("should never be reached"));
+    let mut agent = Agent::new(
+        AGENT_ID,
+        "tester",
+        "system",
+        Arc::clone(&provider) as Arc<dyn LlmProvider>,
+        Arc::new(NoTools),
+    );
+
+    for blank in ["", "   ", "\n\t "] {
+        let err = agent
+            .run(blank)
+            .await
+            .expect_err("a blank prompt should be refused");
+        assert!(err.to_string().contains("empty prompt"), "got: {err}");
+    }
+    assert_eq!(provider.call_count(), 0, "the provider must not be called");
+    assert_eq!(
+        agent.history.len(),
+        1,
+        "only the system prompt should remain"
+    );
+}
+
+#[tokio::test]
+async fn an_enormous_tool_result_is_capped_before_entering_history() {
+    // Compaction leaves recent messages intact, so an uncapped observation in
+    // that tail could never be shrunk by anything.
+    let huge = "y".repeat(400_000);
+    let dispatcher = Arc::new(ScriptedDispatcher::replying("dump", &huge));
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_call_turn("c1", "dump", json!({}), TokenUsage::new(5, 5)),
+        text_turn("done", TokenUsage::new(5, 5)),
+    ]));
+
+    let mut agent = Agent::new(
+        AGENT_ID,
+        "tester",
+        "system",
+        provider,
+        Arc::clone(&dispatcher) as Arc<dyn ToolDispatcher>,
+    );
+    agent.run("dump it").await.expect("run");
+
+    let observation = agent
+        .history
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .and_then(|m| m.content.clone())
+        .expect("a tool observation should exist");
+
+    assert!(
+        observation.len() < huge.len(),
+        "the observation was stored uncapped ({} bytes)",
+        observation.len()
+    );
+    assert!(
+        observation.contains("TRUNCATED"),
+        "truncation must be visible to the model"
+    );
+}
+
+#[tokio::test]
+async fn a_multibyte_tool_result_is_capped_without_splitting_a_character() {
+    // The cap slices by byte length; a naive slice would panic here.
+    let huge = "日本語テキスト".repeat(40_000);
+    let dispatcher = Arc::new(ScriptedDispatcher::replying("dump", &huge));
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_call_turn("c1", "dump", json!({}), TokenUsage::new(5, 5)),
+        text_turn("done", TokenUsage::new(5, 5)),
+    ]));
+
+    let mut agent = Agent::new(
+        AGENT_ID,
+        "tester",
+        "system",
+        provider,
+        Arc::clone(&dispatcher) as Arc<dyn ToolDispatcher>,
+    );
+    agent.run("dump it").await.expect("run");
+
+    let observation = agent
+        .history
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .and_then(|m| m.content.clone())
+        .expect("a tool observation should exist");
+    assert!(observation.contains("TRUNCATED"));
+    assert!(huge.starts_with(observation.split('\n').next().unwrap_or("")));
+}

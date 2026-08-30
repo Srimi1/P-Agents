@@ -139,6 +139,13 @@ impl LlmProvider for GenericOpenAiProvider {
 fn to_wire(messages: &[ChatMessage]) -> Vec<Value> {
     messages
         .iter()
+        // `{"role":"assistant","content":null}` with no tool calls is a 400. The
+        // agent loop never produces one, but a restored transcript can.
+        .filter(|message| {
+            message.role != Role::Assistant
+                || message.content.as_deref().is_some_and(|c| !c.is_empty())
+                || message.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+        })
         .map(|message| match message.role {
             Role::Tool => json!({
                 "role": "tool",

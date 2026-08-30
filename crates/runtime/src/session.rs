@@ -91,6 +91,11 @@ impl SessionStore {
             .await
             .with_context(|| format!("reading session log {}", path.display()))?;
 
+        // Only an *unterminated* final line can be a half-written record. If the
+        // file ends with a newline every line was fully written, so a parse
+        // failure there is real corruption and must not be swallowed.
+        let truncated_tail = !raw.is_empty() && !raw.ends_with('\n');
+
         let mut records = Vec::new();
         let mut lines = raw.lines().filter(|l| !l.trim().is_empty()).peekable();
         while let Some(line) = lines.next() {
@@ -98,7 +103,7 @@ impl SessionStore {
                 Ok(rec) => records.push(rec),
                 // A run killed mid-write leaves a half-written final line.
                 // Everything before it is still good.
-                Err(err) if lines.peek().is_none() => {
+                Err(err) if truncated_tail && lines.peek().is_none() => {
                     warn!(
                         path = %path.display(),
                         error = %err,
@@ -135,6 +140,18 @@ impl SessionStore {
 
     /// Resolves `--resume <id>`, accepting an unambiguous id prefix.
     pub async fn find_by_id(dir: &Path, id: &str) -> Result<PathBuf> {
+        // `id` comes straight from `--resume`. Without this, an id like
+        // "../../etc/whatever" would escape the session directory, because
+        // `Path::join` happily walks upwards.
+        if id.is_empty()
+            || id.contains("..")
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains('\0')
+        {
+            anyhow::bail!("'{id}' is not a valid session id");
+        }
+
         let exact = dir.join(format!("{id}.jsonl"));
         if exact.is_file() {
             return Ok(exact);
@@ -306,6 +323,22 @@ mod tests {
         assert!(SessionStore::load(&path).await.is_err());
     }
 
+    /// A final line that is newline-terminated was fully written, so a parse
+    /// failure there is corruption, not a crashed run. Silently dropping it
+    /// would resume a session with history missing and no warning to the user.
+    #[tokio::test]
+    async fn load_rejects_a_complete_but_corrupt_final_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corrupt.jsonl");
+        tokio::fs::write(
+            &path,
+            "{\"type\":\"meta\",\"session_id\":\"s\",\"created_at\":1,\"model\":\"m\"}\n{\"type\":\"nonsense\"}\n",
+        )
+        .await
+        .unwrap();
+        assert!(SessionStore::load(&path).await.is_err());
+    }
+
     #[tokio::test]
     async fn load_of_a_missing_file_errors() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -331,6 +364,25 @@ mod tests {
         assert!(SessionStore::find_by_id(dir.path(), "deadbeef")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn find_by_id_refuses_to_escape_the_session_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::create_dir_all(&inside).await.unwrap();
+        tokio::fs::write(outside.join("secret.jsonl"), "")
+            .await
+            .unwrap();
+
+        for bad in ["../outside/secret", "/etc/passwd", ""] {
+            assert!(
+                SessionStore::find_by_id(&inside, bad).await.is_err(),
+                "'{bad}' must not resolve"
+            );
+        }
     }
 
     #[tokio::test]

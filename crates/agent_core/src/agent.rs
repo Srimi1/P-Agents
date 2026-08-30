@@ -15,6 +15,12 @@ use tracing::{info, warn};
 /// output still goes into the agent's history; this only bounds the UI payload.
 const TOOL_PREVIEW_BYTES: usize = 240;
 
+/// Hard cap on a single tool observation stored in history. Compaction
+/// deliberately leaves the most recent exchanges intact, so without a cap here
+/// one multi-megabyte tool result in that protected tail can blow the context
+/// window with nothing able to shrink it.
+const MAX_OBSERVATION_BYTES: usize = 100_000;
+
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
     fn get_definitions(&self) -> Vec<ToolDefinition>;
@@ -210,6 +216,13 @@ impl Agent {
     }
 
     pub async fn run(&mut self, user_input: &str) -> Result<String> {
+        // Providers disagree about blank turns: Anthropic drops them and then
+        // rejects the request for having no messages, while OpenAI accepts one.
+        // Refusing here keeps the behaviour the same everywhere.
+        if user_input.trim().is_empty() {
+            anyhow::bail!("Agent received an empty prompt");
+        }
+
         self.push_history(ChatMessage::user(user_input));
         self.set_state(AgentState::Planning);
 
@@ -319,7 +332,7 @@ impl Agent {
                 self.push_history(ChatMessage::tool_response(
                     &tool_call.id,
                     &tool_call.name,
-                    observation,
+                    cap_observation(observation),
                 ));
             }
 
@@ -332,4 +345,18 @@ impl Agent {
             self.max_iterations
         );
     }
+}
+
+/// Bounds a single tool result before it enters history, leaving a marker so the
+/// model knows output was dropped rather than the tool having produced nothing.
+fn cap_observation(observation: String) -> String {
+    if observation.len() <= MAX_OBSERVATION_BYTES {
+        return observation;
+    }
+    let kept = truncate_at_boundary(&observation, MAX_OBSERVATION_BYTES);
+    format!(
+        "{kept}\n... [TRUNCATED: {} bytes omitted; the tool produced more output than one \
+         observation may carry. Narrow the request to see the rest.]",
+        observation.len() - kept.len()
+    )
 }
