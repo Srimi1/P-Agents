@@ -7,6 +7,6 @@ pub use context_manager::ContextManager;
 pub use tool_registry::{HarnessToolRegistry, Tool};
 pub use tools::{
     BashCommandTool, EditFileBlockTool, FindFilesByNameTool, GrepSearchTool, ListDirTool,
-    ReadFileTool, WriteFileTool,
+    PtyCloseTool, PtySendTool, PtyStartTool, ReadFileTool, WriteFileTool,
 };
 pub use workspace::WorkspacePolicy;

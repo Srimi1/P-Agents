@@ -13,6 +13,7 @@ pub struct HarnessConfig {
     pub provider: ProviderConfig,
     pub limits: LimitsConfig,
     pub permissions: PermissionsConfig,
+    pub tools: ToolsConfig,
     /// Extra personas merged into the spawn tool's role list.
     pub personas: BTreeMap<String, PersonaConfig>,
 }
@@ -153,6 +154,16 @@ impl Default for PermissionsConfig {
     }
 }
 
+/// Which optional tool groups the agents get. Every registered tool's schema
+/// is sent on every request, so this is a context-budget decision as much as a
+/// capability one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Interactive terminal sessions: pty_start, pty_send, pty_close.
+    pub interactive_terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaConfig {
     #[serde(default)]
@@ -290,6 +301,12 @@ impl HarnessConfig {
         harness_core::WorkspacePolicy::with_roots(&self.permissions.workspace_roots)
     }
 
+    pub fn toolset(&self) -> subagents::ToolsetOptions {
+        subagents::ToolsetOptions {
+            interactive_terminal: self.tools.interactive_terminal,
+        }
+    }
+
     pub fn grant_scope(&self) -> runtime::GrantScope {
         match self.permissions.grant_scope.as_str() {
             "agent" => runtime::GrantScope::Agent,
@@ -337,6 +354,15 @@ mod tests {
             return;
         }
         assert!(config.api_key_for("anthropic").is_none());
+    }
+
+    #[test]
+    fn interactive_terminal_tools_are_opt_in() {
+        // They are arbitrary interactive execution and cost schema tokens on
+        // every request, so they must not appear unless asked for.
+        let config = HarnessConfig::default();
+        assert!(!config.tools.interactive_terminal);
+        assert!(!config.toolset().interactive_terminal);
     }
 
     #[test]

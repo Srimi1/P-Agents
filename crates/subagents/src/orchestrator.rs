@@ -7,7 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use harness_core::{
     BashCommandTool, EditFileBlockTool, FindFilesByNameTool, GrepSearchTool, HarnessToolRegistry,
-    ListDirTool, ReadFileTool, Tool, WorkspacePolicy, WriteFileTool,
+    ListDirTool, PtyCloseTool, PtySendTool, PtyStartTool, ReadFileTool, Tool, WorkspacePolicy,
+    WriteFileTool,
 };
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -20,7 +21,18 @@ use std::sync::Arc;
 /// `policy` bounds which paths the file tools will touch. It is a required
 /// argument rather than an option with a default, because a defaulted-away
 /// policy would silently ship no containment at all.
-pub fn build_tool_registry(policy: Arc<WorkspacePolicy>) -> HarnessToolRegistry {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolsetOptions {
+    /// Register the interactive terminal tools. Off by default: they are
+    /// arbitrary interactive execution, and three extra tool schemas ride along
+    /// on every single request whether or not the model ever uses them.
+    pub interactive_terminal: bool,
+}
+
+pub fn build_tool_registry(
+    policy: Arc<WorkspacePolicy>,
+    options: ToolsetOptions,
+) -> HarnessToolRegistry {
     let mut registry = HarnessToolRegistry::new();
     registry.register(Arc::new(ReadFileTool::new(Arc::clone(&policy))));
     registry.register(Arc::new(WriteFileTool::new(Arc::clone(&policy))));
@@ -28,7 +40,13 @@ pub fn build_tool_registry(policy: Arc<WorkspacePolicy>) -> HarnessToolRegistry 
     registry.register(Arc::new(ListDirTool::new(Arc::clone(&policy))));
     registry.register(Arc::new(GrepSearchTool::new(Arc::clone(&policy))));
     registry.register(Arc::new(FindFilesByNameTool::new(Arc::clone(&policy))));
-    registry.register(Arc::new(BashCommandTool::new(policy)));
+    registry.register(Arc::new(BashCommandTool::new(Arc::clone(&policy))));
+
+    if options.interactive_terminal {
+        registry.register(Arc::new(PtyStartTool::new(Arc::clone(&policy))));
+        registry.register(Arc::new(PtySendTool::new(Arc::clone(&policy))));
+        registry.register(Arc::new(PtyCloseTool::new(policy)));
+    }
     registry
 }
 

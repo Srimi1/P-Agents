@@ -187,6 +187,18 @@ Every tool above except `run_bash_command` resolves its path against the
 workspace roots first and refuses anything outside them. `run_bash_command`
 only has its `cwd` checked — the command itself is unconstrained.
 
+Setting `tools.interactive_terminal = true` adds three more, for driving
+programs that prompt for input:
+
+| Tool | Approval | Notes |
+| --- | --- | --- |
+| `pty_start` | yes | Starts a program on a PTY, returns a session id |
+| `pty_send` | yes | Sends input to a session and returns new output |
+| `pty_close` | yes | Kills the program and releases the session |
+
+They are off by default: it is arbitrary interactive execution, and their
+schemas ride along on every request whether or not the model uses them.
+
 ## Known limitations
 
 Worth knowing before you point this at something important.

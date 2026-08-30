@@ -289,3 +289,31 @@ async fn sub_agent_ids_stay_unique_after_the_lead_agent_is_rebuilt() {
     // saw two separate isolated contexts.
     assert_eq!(provider.call_count(), 2);
 }
+
+#[test]
+fn the_interactive_terminal_tools_are_only_registered_when_asked_for() {
+    use agent_core::ToolDispatcher;
+    use harness_core::WorkspacePolicy;
+    use subagents::{build_tool_registry, ToolsetOptions};
+
+    let policy = Arc::new(WorkspacePolicy::unrestricted());
+
+    let lean = build_tool_registry(Arc::clone(&policy), ToolsetOptions::default());
+    let names: Vec<String> = lean.get_definitions().into_iter().map(|d| d.name).collect();
+    assert!(names.contains(&"read_file".to_string()));
+    assert!(
+        !names.iter().any(|n| n.starts_with("pty_")),
+        "pty tools must not ride along by default: {names:?}"
+    );
+
+    let full = build_tool_registry(
+        policy,
+        ToolsetOptions {
+            interactive_terminal: true,
+        },
+    );
+    let names: Vec<String> = full.get_definitions().into_iter().map(|d| d.name).collect();
+    for expected in ["pty_start", "pty_send", "pty_close"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}");
+    }
+}

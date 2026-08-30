@@ -67,6 +67,14 @@ workspace_roots = []
 #   "agent" — that tool, only for the agent that was asked
 grant_scope = "tool"
 
+[tools]
+# Interactive terminal sessions: pty_start, pty_send, pty_close. These let an
+# agent drive a program that prompts for input — a REPL, an installer, a
+# "are you sure? [y/N]". Off by default for two reasons: it is arbitrary
+# interactive execution, and three extra tool schemas ride along on every
+# request whether or not the model ever uses them.
+interactive_terminal = false
+
 # Extra personas are merged into the roles spawn_subagent accepts, alongside the
 # six built-ins (planner, engineer, verifier, critic, researcher, analyst).
 # Reusing a built-in name replaces its prompt.

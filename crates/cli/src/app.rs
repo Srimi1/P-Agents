@@ -83,7 +83,10 @@ impl HarnessApp {
         // Built before the runtime so a bad root fails at startup rather than
         // on the agent's first file access.
         let workspace = Arc::new(config.workspace_policy()?);
-        let registry = Arc::new(build_tool_registry(Arc::clone(&workspace)));
+        let registry = Arc::new(build_tool_registry(
+            Arc::clone(&workspace),
+            config.toolset(),
+        ));
         let dispatcher: Arc<dyn ToolDispatcher> = runtime.dispatcher(registry);
 
         let compactor: Arc<dyn HistoryCompactor> =
