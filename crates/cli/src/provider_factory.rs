@@ -27,7 +27,9 @@ pub fn make_provider(
                     .with_max_tokens(config.provider.anthropic.max_tokens),
             ))
         }
-        "openai" => {
+        // `GenericOpenAiProvider::provider_name()` reports "openai_compatible",
+        // and `/model <name>` feeds that name straight back in here.
+        "openai" | "openai_compatible" => {
             let key = config.api_key_for("openai").ok_or_else(|| {
                 anyhow::anyhow!(
                     "No OpenAI API key. Set OPENAI_API_KEY, or run with --provider anthropic / --mock. \
@@ -120,6 +122,16 @@ mod tests {
         let config = HarnessConfig::default();
         let provider = make_provider(&config, Some("mock"), None).unwrap();
         assert_eq!(provider.provider_name(), "mock");
+    }
+
+    #[test]
+    fn the_providers_own_name_round_trips_through_the_factory() {
+        // What /model passes back must be a name the factory accepts.
+        let mut config = HarnessConfig::default();
+        config.provider.openai.api_key = Some("test-key".to_string());
+        let built = make_provider(&config, Some("openai"), None).unwrap();
+        let again = make_provider(&config, Some(built.provider_name()), None);
+        assert!(again.is_ok(), "provider_name() must be a valid factory key");
     }
 
     #[test]

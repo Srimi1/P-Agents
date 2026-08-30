@@ -29,7 +29,11 @@ pub struct SubAgentFactory {
     compactor: Option<Arc<dyn HistoryCompactor>>,
     parent_id: String,
     max_iterations: usize,
-    counter: AtomicUsize,
+    /// Shared with the orchestrator so ids stay unique for the whole session.
+    /// A per-factory counter would restart at 1 every time the lead agent is
+    /// rebuilt (`/model`), and two different sub-agents would then write to the
+    /// same agent_id in one session log.
+    counter: Arc<AtomicUsize>,
 }
 
 impl SubAgentFactory {
@@ -39,6 +43,22 @@ impl SubAgentFactory {
         personas: Arc<PersonaRegistry>,
         parent_id: impl Into<String>,
     ) -> Self {
+        Self::with_counter(
+            provider,
+            dispatcher,
+            personas,
+            parent_id,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    pub fn with_counter(
+        provider: Arc<dyn LlmProvider>,
+        dispatcher: Arc<dyn ToolDispatcher>,
+        personas: Arc<PersonaRegistry>,
+        parent_id: impl Into<String>,
+        counter: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             provider,
             dispatcher,
@@ -47,7 +67,7 @@ impl SubAgentFactory {
             compactor: None,
             parent_id: parent_id.into(),
             max_iterations: 20,
-            counter: AtomicUsize::new(0),
+            counter,
         }
     }
 

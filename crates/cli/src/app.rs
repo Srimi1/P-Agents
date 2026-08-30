@@ -24,6 +24,8 @@ pub struct HarnessApp {
     pub lead: Agent,
     pub provider_name: String,
     pub model_name: String,
+    /// Kept so `/resume` looks in the same place `--session-dir` writes to.
+    pub session_dir: PathBuf,
 }
 
 pub struct AppOptions {
@@ -67,6 +69,7 @@ impl HarnessApp {
         let provider_name = provider.provider_name().to_string();
         let model_name = provider.model_name().to_string();
 
+        let session_dir = options.session_dir.clone();
         let yolo = options.yolo || config.permissions.yolo;
         let security = SecurityManager::new()
             .with_yolo(yolo)
@@ -98,6 +101,7 @@ impl HarnessApp {
                 lead,
                 provider_name,
                 model_name,
+                session_dir,
             },
             approvals,
         ))
@@ -131,15 +135,28 @@ impl HarnessApp {
     pub async fn resume(&mut self, session_dir: &Path, session_id: &str) -> Result<usize> {
         let path = SessionStore::find_by_id(session_dir, session_id).await?;
         let records = SessionStore::load(&path).await?;
-        let history = SessionStore::rebuild_history(&records, LEAD_AGENT_ID);
+        let mut history = SessionStore::rebuild_history(&records, LEAD_AGENT_ID);
         if history.is_empty() {
             anyhow::bail!(
                 "Session {} has no messages for the lead agent",
                 path.display()
             );
         }
+        repair_interrupted_history(&mut history);
+
         let restored = history.len();
-        self.lead.restore_history(history);
+        self.lead.restore_history(history.clone());
+
+        // `restore_history` assigns the field directly, so nothing reaches the
+        // session store the runtime opened for this run. Replay it, or the new
+        // transcript starts mid-conversation and resuming *it* loses the past.
+        let sink = self.runtime.event_sink();
+        for message in history {
+            let _ = sink.send(agent_core::AgentEvent::MessageAppended {
+                agent_id: LEAD_AGENT_ID.to_string(),
+                message,
+            });
+        }
         Ok(restored)
     }
 
@@ -173,6 +190,43 @@ impl HarnessApp {
     pub async fn shutdown(self) {
         self.runtime.shutdown().await;
     }
+}
+
+/// Makes a transcript safe to send again.
+///
+/// A run killed between issuing a tool call and recording its result leaves an
+/// assistant turn whose `tool_calls` have no matching responses. Both providers
+/// reject that: Anthropic 400s with "tool_use ids were found without
+/// tool_result blocks". Answering the orphans keeps the pairing valid and tells
+/// the model what actually happened.
+fn repair_interrupted_history(history: &mut Vec<ChatMessage>) {
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for message in history.iter() {
+        if let Some(id) = &message.tool_call_id {
+            answered.insert(id.clone());
+        }
+    }
+
+    let mut repaired: Vec<ChatMessage> = Vec::with_capacity(history.len());
+    for message in history.drain(..) {
+        let orphans: Vec<(String, String)> = message
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| !answered.contains(&call.id))
+            .map(|call| (call.id.clone(), call.name.clone()))
+            .collect();
+
+        repaired.push(message);
+        for (id, name) in orphans {
+            repaired.push(ChatMessage::tool_response(
+                &id,
+                &name,
+                "The previous session ended before this tool call completed. Its result is unknown; re-run it if you still need it.",
+            ));
+        }
+    }
+    *history = repaired;
 }
 
 fn build_orchestrator(

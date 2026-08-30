@@ -1,13 +1,13 @@
-use crate::app::{HarnessApp, SESSION_DIR};
+use crate::app::HarnessApp;
 use agent_core::TokenUsage;
 use anyhow::Result;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use runtime::{ApprovalDecision, ApprovalRequest, HarnessEvent};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subagents::LEAD_AGENT_ID;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -26,7 +26,9 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 /// FIFO, seeing it means everything the turn produced has already been drawn.
 const SYNC_AGENT_ID: &str = "__repl_sync__";
 
-type Lines = Arc<AsyncMutex<mpsc::UnboundedReceiver<String>>>;
+/// Each line carries the moment it was read, so an approval prompt can tell a
+/// deliberate answer from something typed before the question existed.
+type Lines = Arc<AsyncMutex<mpsc::UnboundedReceiver<(Instant, String)>>>;
 type UsageTable = Arc<Mutex<HashMap<String, TokenUsage>>>;
 
 /// Shared with the renderer so it knows whose tokens to print as the primary
@@ -117,7 +119,7 @@ pub async fn start_repl(
                 ),
                 Err(err) => println!("  {} {}", "model change failed:".red(), err),
             },
-            Command::Resume(id) => match app.resume(std::path::Path::new(SESSION_DIR), &id).await {
+            Command::Resume(id) => match app.resume(&app.session_dir.clone(), &id).await {
                 Ok(n) => println!(
                     "  {} {} messages from session {}",
                     "restored".green(),
@@ -372,7 +374,7 @@ fn spawn_stdin_reader() -> Lines {
         for line in stdin.lock().lines() {
             match line {
                 Ok(line) => {
-                    if tx.send(line).is_err() {
+                    if tx.send((Instant::now(), line)).is_err() {
                         break;
                     }
                 }
@@ -384,7 +386,26 @@ fn spawn_stdin_reader() -> Lines {
 }
 
 async fn read_line(lines: &Lines) -> Option<String> {
-    lines.lock().await.recv().await
+    lines.lock().await.recv().await.map(|(_, line)| line)
+}
+
+/// Reads an answer to a question posed at `asked_at`, skipping anything typed
+/// before it was asked.
+///
+/// A line already sitting in the queue was typed without having seen the
+/// prompt, so accepting it would let stray input authorize a write or a shell
+/// command — and `a` would grant that tool for the rest of the session. Only
+/// applied on a terminal: piped input is legitimately "ahead" by definition.
+async fn read_answer(lines: &Lines, asked_at: Instant) -> Option<String> {
+    let interactive = io::stdin().is_terminal();
+    let mut rx = lines.lock().await;
+    loop {
+        let (arrived, line) = rx.recv().await?;
+        if interactive && arrived < asked_at {
+            continue;
+        }
+        return Some(line);
+    }
 }
 
 // --------------------------------------------------------------- renderer
@@ -659,11 +680,9 @@ async fn prompt_for_approval(request: &ApprovalRequest, lines: &Lines) -> Approv
         "allow? [y]es / [n]o / [a]lways (this tool, any agent, rest of session):".bold()
     );
     let _ = io::stdout().flush();
+    let asked_at = Instant::now();
 
-    // Deliberately no "discard type-ahead" step here. Draining buffered lines
-    // would swallow the answer whenever input arrives faster than the prompt is
-    // drawn, which is always the case for piped input.
-    match read_line(lines).await {
+    match read_answer(lines, asked_at).await {
         Some(answer) => match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => ApprovalDecision::Approve,
             "a" | "always" => ApprovalDecision::ApproveForSession,

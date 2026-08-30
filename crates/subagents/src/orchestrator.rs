@@ -10,6 +10,7 @@ use harness_core::{
     ListDirTool, ReadFileTool, Tool, WriteFileTool,
 };
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// The default environment tools every agent gets. The caller wraps the result
@@ -77,6 +78,9 @@ pub struct MultiAgentOrchestrator {
     personas: Arc<PersonaRegistry>,
     max_parallel: usize,
     max_iterations: usize,
+    /// Sub-agent id sequence, owned here so it survives rebuilding the lead
+    /// agent for a model swap.
+    subagent_counter: Arc<AtomicUsize>,
 }
 
 impl MultiAgentOrchestrator {
@@ -86,6 +90,7 @@ impl MultiAgentOrchestrator {
             personas: Arc::new(PersonaRegistry::new()),
             max_parallel: 4,
             max_iterations: 20,
+            subagent_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -123,11 +128,12 @@ impl MultiAgentOrchestrator {
         parent_id: &str,
     ) -> Arc<SubAgentFactory> {
         Arc::new(
-            SubAgentFactory::new(
+            SubAgentFactory::with_counter(
                 Arc::clone(&self.provider),
                 dispatcher,
                 Arc::clone(&self.personas),
                 parent_id,
+                Arc::clone(&self.subagent_counter),
             )
             .with_events(events)
             .with_compactor(compactor)

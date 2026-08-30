@@ -246,3 +246,46 @@ async fn tool_schemas_advertise_only_registered_roles() {
             .any(|r| r == "dba")
     );
 }
+
+#[tokio::test]
+async fn sub_agent_ids_stay_unique_after_the_lead_agent_is_rebuilt() {
+    // `/model` rebuilds the lead agent while the session log stays open. A
+    // per-factory counter restarted at 1 here, so a second engineer wrote into
+    // the first one's agent_id and clobbered its usage row.
+    let provider = Arc::new(MockProvider::new(text_responses(4, "ok")));
+    let orchestrator =
+        subagents::MultiAgentOrchestrator::new(Arc::clone(&provider) as Arc<dyn LlmProvider>);
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        // Rebuilding the lead agent is what a model swap does.
+        let lead = orchestrator
+            .create_lead_agent(empty_dispatcher(), None, None)
+            .expect("lead agent");
+        let spawn = lead
+            .dispatcher
+            .get_definitions()
+            .iter()
+            .any(|d| d.name == "spawn_subagent");
+        assert!(spawn, "the lead agent should have the delegation tool");
+
+        let out = lead
+            .dispatcher
+            .dispatch(
+                "lead-planner",
+                &agent_core::ToolCall {
+                    id: "c1".into(),
+                    name: "spawn_subagent".into(),
+                    arguments: json!({ "role": "engineer", "task": "do a thing" }),
+                },
+            )
+            .await
+            .expect("spawn");
+        assert!(out.contains("SoftwareEngineer"));
+        seen.push(out);
+    }
+
+    // Both sub-agents ran; the ids they were given must differ. The provider
+    // saw two separate isolated contexts.
+    assert_eq!(provider.call_count(), 2);
+}

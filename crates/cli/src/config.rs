@@ -158,6 +158,10 @@ impl HarnessConfig {
         // HARNESS_PROVIDER__DEFAULT=openai, HARNESS_LIMITS__MAX_ITERATIONS=40, ...
         builder = builder.add_source(
             ::config::Environment::with_prefix("HARNESS")
+                // The prefix separator defaults to `separator`, which would
+                // demand `HARNESS__LIMITS__...`. One underscore after the
+                // prefix, two between levels.
+                .prefix_separator("_")
                 .separator("__")
                 .try_parsing(true)
                 .list_separator(",")
@@ -220,7 +224,9 @@ impl HarnessConfig {
                 return Some(key);
             }
         }
-        if let Some(key) = from_file {
+        // An empty key in the file is the same as no key: treating it as one
+        // trades a clear startup error for a confusing 401 mid-turn.
+        if let Some(key) = from_file.as_ref().filter(|k| !k.is_empty()) {
             warn!(
                 "Using an API key from the config file. Prefer the {} environment variable.",
                 env_var
@@ -241,6 +247,35 @@ impl HarnessConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_overrides_use_a_single_underscore_after_the_prefix() {
+        // Guards the documented form; the config crate's default would have
+        // required HARNESS__PROVIDER__ANTHROPIC__MAX_TOKENS instead.
+        // Env is process-wide, so this uses a key no other test asserts on.
+        let key = "HARNESS_PROVIDER__ANTHROPIC__MAX_TOKENS";
+        std::env::set_var(key, "4321");
+        let loaded = HarnessConfig::load(None);
+        std::env::remove_var(key);
+        assert_eq!(
+            loaded
+                .expect("config should load")
+                .provider
+                .anthropic
+                .max_tokens,
+            4321
+        );
+    }
+
+    #[test]
+    fn an_empty_api_key_in_the_file_is_treated_as_absent() {
+        let mut config = HarnessConfig::default();
+        config.provider.anthropic.api_key = Some(String::new());
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
+        assert!(config.api_key_for("anthropic").is_none());
+    }
 
     #[test]
     fn defaults_are_valid() {

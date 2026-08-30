@@ -294,3 +294,75 @@ async fn resuming_an_unknown_session_is_a_clean_error() {
     assert!(err.to_string().contains("does-not-exist"), "got: {err}");
     app.shutdown().await;
 }
+
+/// A run killed between issuing a tool call and recording its result leaves an
+/// assistant turn whose tool_calls have no answers. Sending that back is a 400
+/// on both providers, which used to make the resumed session unusable forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resuming_an_interrupted_run_repairs_the_orphaned_tool_call() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sessions = workdir.path().join("sessions");
+
+    // Turn one issues a tool call; the provider script then runs out, standing
+    // in for the process being killed before the observation was recorded.
+    let script = vec![tool_turn(vec![call(
+        "orphan_1",
+        "read_file",
+        json!({ "path": "somewhere.txt" }),
+    )])];
+    let (mut first, _a1, _p1) = build(script, &sessions, true).await;
+    let session_id = first.runtime.session_id().to_string();
+    let _ = first.run_prompt("start something").await;
+    first.shutdown().await;
+
+    let (mut second, _a2, _p2) = build(vec![text_turn("carrying on")], &sessions, true).await;
+    second.resume(&sessions, &session_id).await.expect("resume");
+
+    // Every tool call in the restored history now has a matching response.
+    let answered: std::collections::HashSet<String> = second
+        .history()
+        .iter()
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    for message in second.history() {
+        for tool_call in message.tool_calls.iter().flatten() {
+            assert!(
+                answered.contains(&tool_call.id),
+                "tool call {} was left unanswered; the next request would 400",
+                tool_call.id
+            );
+        }
+    }
+
+    // And the session is actually usable again.
+    let answer = second.run_prompt("continue").await.expect("resumed run");
+    assert_eq!(answer, "carrying on");
+    second.shutdown().await;
+}
+
+/// Resuming used to swap history in without telling the session store, so the
+/// new transcript began mid-conversation and resuming *it* lost the past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_session_records_the_history_it_inherited() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sessions = workdir.path().join("sessions");
+
+    let (mut first, _a1, _p1) = build(vec![text_turn("noted")], &sessions, true).await;
+    let first_id = first.runtime.session_id().to_string();
+    first.run_prompt("remember 8675309").await.expect("run");
+    first.shutdown().await;
+
+    let (mut second, _a2, _p2) = build(vec![text_turn("ok")], &sessions, true).await;
+    let second_path = second.runtime.session_path().to_path_buf();
+    second.resume(&sessions, &first_id).await.expect("resume");
+    second.shutdown().await;
+
+    let records = SessionStore::load(&second_path).await.expect("session log");
+    let history = SessionStore::rebuild_history(&records, "lead-planner");
+    assert!(
+        history
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| c.contains("8675309"))),
+        "the inherited transcript should be in the new session file too"
+    );
+}
