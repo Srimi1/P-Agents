@@ -163,6 +163,29 @@ what keeps delegation one level deep rather than unbounded.
 | `edit_file_block` | yes | Exact-match replacement; refuses ambiguous matches |
 | `run_bash_command` | yes | Timeout kills the child; optional background mode |
 
+## Known limitations
+
+Worth knowing before you point this at something important.
+
+- **There is no filesystem sandbox.** The read-only tools will happily read any
+  path the process can reach, including `~/.ssh` and files outside the working
+  directory, and they do not prompt. The approval gate covers writing and shell
+  execution, not reading. Run the harness as a user that only has access to what
+  you are willing to expose.
+- **A session grant is per-tool, not per-agent.** Answering `a` to an approval
+  clears that tool for every agent, lead and sub-agents alike, until you exit.
+  Use `y` if you only meant this one call.
+- **Command timeouts kill the shell, not its descendants.** A timed-out
+  `run_bash_command` kills the `sh` it started; a grandchild that shell spawned
+  keeps running until it finishes on its own.
+- **Background commands are not fully detached.** They share the harness's
+  process group, so Ctrl-C in the terminal signals them too.
+- **`--yolo` disables the gate entirely**, including for sub-agents. It is for
+  CI and scripted runs.
+- **Nothing here has been exercised against a live API in this build.** Both
+  providers are covered end-to-end against a loopback HTTP server that asserts
+  the exact request they emit, but no real endpoint was contacted.
+
 ## Development
 
 ```bash
