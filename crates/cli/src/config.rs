@@ -20,10 +20,11 @@ pub struct HarnessConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
-    /// "anthropic" or "openai".
+    /// "anthropic", "openai", or "gemini".
     pub default: String,
     pub anthropic: AnthropicConfig,
     pub openai: OpenAiConfig,
+    pub gemini: GeminiConfig,
 }
 
 impl Default for ProviderConfig {
@@ -32,6 +33,7 @@ impl Default for ProviderConfig {
             default: "anthropic".to_string(),
             anthropic: AnthropicConfig::default(),
             openai: OpenAiConfig::default(),
+            gemini: GeminiConfig::default(),
         }
     }
 }
@@ -76,6 +78,26 @@ impl Default for OpenAiConfig {
     }
 }
 
+/// Gemini speaks the OpenAI chat format on a compatibility endpoint, so it
+/// reuses the OpenAI client rather than needing a provider of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeminiConfig {
+    pub model: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        Self {
+            model: "gemini-2.5-flash".to_string(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            api_key: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
@@ -101,6 +123,15 @@ pub struct PermissionsConfig {
     pub auto_approve: Vec<String>,
     /// Approve everything without asking. Intended for CI and scripted runs.
     pub yolo: bool,
+    /// Confine the file tools to `workspace_roots`. Reads are not gated by the
+    /// approval prompt, so without this an agent can read any file the process
+    /// can reach.
+    pub sandbox: bool,
+    /// Roots the file tools may touch. Empty means the working directory.
+    pub workspace_roots: Vec<PathBuf>,
+    /// How far an "always approve" answer reaches: "tool" covers that tool for
+    /// every agent, "agent" covers it only for the agent that was asked.
+    pub grant_scope: String,
 }
 
 impl Default for PermissionsConfig {
@@ -115,6 +146,9 @@ impl Default for PermissionsConfig {
                 "find_files_by_name".to_string(),
             ],
             yolo: false,
+            sandbox: true,
+            workspace_roots: Vec::new(),
+            grant_scope: "tool".to_string(),
         }
     }
 }
@@ -193,10 +227,10 @@ impl HarnessConfig {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.provider.default.as_str(),
-            "anthropic" | "openai" | "mock"
+            "anthropic" | "openai" | "gemini" | "mock"
         ) {
             anyhow::bail!(
-                "Unknown provider '{}'. Expected 'anthropic', 'openai', or 'mock'.",
+                "Unknown provider '{}'. Expected 'anthropic', 'openai', 'gemini', or 'mock'.",
                 self.provider.default
             );
         }
@@ -209,6 +243,12 @@ impl HarnessConfig {
         if self.provider.anthropic.max_tokens == 0 {
             anyhow::bail!("provider.anthropic.max_tokens must be greater than zero");
         }
+        if !matches!(self.permissions.grant_scope.as_str(), "tool" | "agent") {
+            anyhow::bail!(
+                "Unknown permissions.grant_scope '{}'. Expected 'tool' or 'agent'.",
+                self.permissions.grant_scope
+            );
+        }
         Ok(())
     }
 
@@ -217,6 +257,7 @@ impl HarnessConfig {
     pub fn api_key_for(&self, provider: &str) -> Option<String> {
         let (env_var, from_file) = match provider {
             "anthropic" => ("ANTHROPIC_API_KEY", &self.provider.anthropic.api_key),
+            "gemini" => ("GEMINI_API_KEY", &self.provider.gemini.api_key),
             _ => ("OPENAI_API_KEY", &self.provider.openai.api_key),
         };
         if let Ok(key) = std::env::var(env_var) {
@@ -236,9 +277,30 @@ impl HarnessConfig {
         None
     }
 
+    /// Builds the filesystem containment policy. Defaults to the working
+    /// directory when no roots are configured, so a fresh install is confined
+    /// rather than open.
+    pub fn workspace_policy(&self) -> Result<harness_core::WorkspacePolicy> {
+        if !self.permissions.sandbox {
+            return Ok(harness_core::WorkspacePolicy::unrestricted());
+        }
+        if self.permissions.workspace_roots.is_empty() {
+            return harness_core::WorkspacePolicy::current_dir();
+        }
+        harness_core::WorkspacePolicy::with_roots(&self.permissions.workspace_roots)
+    }
+
+    pub fn grant_scope(&self) -> runtime::GrantScope {
+        match self.permissions.grant_scope.as_str() {
+            "agent" => runtime::GrantScope::Agent,
+            _ => runtime::GrantScope::Tool,
+        }
+    }
+
     pub fn model_for(&self, provider: &str) -> &str {
         match provider {
             "anthropic" => &self.provider.anthropic.model,
+            "gemini" => &self.provider.gemini.model,
             _ => &self.provider.openai.model,
         }
     }
@@ -278,6 +340,33 @@ mod tests {
     }
 
     #[test]
+    fn the_sandbox_is_on_by_default_and_confines_to_the_working_directory() {
+        let config = HarnessConfig::default();
+        assert!(config.permissions.sandbox, "containment must not be opt-in");
+        let policy = config.workspace_policy().expect("policy");
+        assert!(!policy.is_unrestricted());
+        assert!(policy.resolve("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_sandbox_can_be_turned_off_explicitly() {
+        let mut config = HarnessConfig::default();
+        config.permissions.sandbox = false;
+        assert!(config.workspace_policy().expect("policy").is_unrestricted());
+    }
+
+    #[test]
+    fn grant_scope_parses_and_is_validated() {
+        let mut config = HarnessConfig::default();
+        assert_eq!(config.grant_scope(), runtime::GrantScope::Tool);
+        config.permissions.grant_scope = "agent".to_string();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.grant_scope(), runtime::GrantScope::Agent);
+        config.permissions.grant_scope = "everything".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn defaults_are_valid() {
         let config = HarnessConfig::default();
         assert!(config.validate().is_ok());
@@ -292,7 +381,7 @@ mod tests {
     #[test]
     fn rejects_unknown_provider() {
         let mut config = HarnessConfig::default();
-        config.provider.default = "gemini".to_string();
+        config.provider.default = "hal9000".to_string();
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("Unknown provider"));
     }

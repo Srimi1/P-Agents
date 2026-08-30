@@ -1,5 +1,6 @@
 //! Policy layer deciding which tool calls have to be shown to the user.
 
+use crate::approval::GrantScope;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default)]
@@ -7,6 +8,10 @@ pub struct SecurityManager {
     /// Tools the operator pre-cleared for this run, overriding the tool's own
     /// `requires_approval`.
     auto_approved: HashSet<String>,
+    /// Blast radius of an "approve for session" answer. Carried here so config
+    /// owns it; the `ApprovalGate` has to be built with the same value, since
+    /// the gate is what actually keys the grants.
+    grant_scope: GrantScope,
     yolo: bool,
 }
 
@@ -17,6 +22,11 @@ impl SecurityManager {
 
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo = yolo;
+        self
+    }
+
+    pub fn with_grant_scope(mut self, scope: GrantScope) -> Self {
+        self.grant_scope = scope;
         self
     }
 
@@ -35,6 +45,10 @@ impl SecurityManager {
 
     pub fn is_yolo(&self) -> bool {
         self.yolo
+    }
+
+    pub fn grant_scope(&self) -> GrantScope {
+        self.grant_scope
     }
 
     pub fn is_auto_approved(&self, tool_name: &str) -> bool {
@@ -92,5 +106,28 @@ mod tests {
         other.auto_approve("run_bash_command");
         assert!(sec.needs_approval("run_bash_command", true));
         assert!(!other.needs_approval("run_bash_command", true));
+    }
+
+    #[test]
+    fn grant_scope_defaults_to_tool_wide() {
+        assert_eq!(SecurityManager::new().grant_scope(), GrantScope::Tool);
+    }
+
+    #[test]
+    fn grant_scope_is_opt_in() {
+        let sec = SecurityManager::new().with_grant_scope(GrantScope::Agent);
+        assert_eq!(sec.grant_scope(), GrantScope::Agent);
+        // Narrowing grants must not silently waive approval anywhere.
+        assert!(sec.needs_approval("run_bash_command", true));
+    }
+
+    #[test]
+    fn grant_scope_survives_the_other_builders() {
+        let sec = SecurityManager::new()
+            .with_grant_scope(GrantScope::Agent)
+            .with_auto_approved(["read_file"])
+            .with_yolo(false);
+        assert_eq!(sec.grant_scope(), GrantScope::Agent);
+        assert_eq!(sec.clone().grant_scope(), GrantScope::Agent);
     }
 }

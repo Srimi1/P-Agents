@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use harness_core::{
     BashCommandTool, EditFileBlockTool, FindFilesByNameTool, GrepSearchTool, HarnessToolRegistry,
-    ListDirTool, ReadFileTool, Tool, WriteFileTool,
+    ListDirTool, ReadFileTool, Tool, WorkspacePolicy, WriteFileTool,
 };
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -16,15 +16,19 @@ use std::sync::Arc;
 /// The default environment tools every agent gets. The caller wraps the result
 /// in the runtime's `GatedDispatcher` so approval policy applies to lead and
 /// sub-agents alike.
-pub fn build_tool_registry() -> HarnessToolRegistry {
+///
+/// `policy` bounds which paths the file tools will touch. It is a required
+/// argument rather than an option with a default, because a defaulted-away
+/// policy would silently ship no containment at all.
+pub fn build_tool_registry(policy: Arc<WorkspacePolicy>) -> HarnessToolRegistry {
     let mut registry = HarnessToolRegistry::new();
-    registry.register(Arc::new(ReadFileTool));
-    registry.register(Arc::new(WriteFileTool));
-    registry.register(Arc::new(EditFileBlockTool));
-    registry.register(Arc::new(ListDirTool));
-    registry.register(Arc::new(GrepSearchTool));
-    registry.register(Arc::new(FindFilesByNameTool));
-    registry.register(Arc::new(BashCommandTool));
+    registry.register(Arc::new(ReadFileTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(WriteFileTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(EditFileBlockTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(ListDirTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(GrepSearchTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(FindFilesByNameTool::new(Arc::clone(&policy))));
+    registry.register(Arc::new(BashCommandTool::new(policy)));
     registry
 }
 

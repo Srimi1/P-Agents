@@ -24,6 +24,7 @@ pub struct HarnessApp {
     pub lead: Agent,
     pub provider_name: String,
     pub model_name: String,
+    pub workspace: Arc<harness_core::WorkspacePolicy>,
     /// Kept so `/resume` looks in the same place `--session-dir` writes to.
     pub session_dir: PathBuf,
 }
@@ -73,12 +74,16 @@ impl HarnessApp {
         let yolo = options.yolo || config.permissions.yolo;
         let security = SecurityManager::new()
             .with_yolo(yolo)
+            .with_grant_scope(config.grant_scope())
             .with_auto_approved(config.permissions.auto_approve.clone());
 
         let (runtime, approvals) =
             HarnessRuntime::new(&options.session_dir, &model_name, security, yolo).await?;
 
-        let registry = Arc::new(build_tool_registry());
+        // Built before the runtime so a bad root fails at startup rather than
+        // on the agent's first file access.
+        let workspace = Arc::new(config.workspace_policy()?);
+        let registry = Arc::new(build_tool_registry(Arc::clone(&workspace)));
         let dispatcher: Arc<dyn ToolDispatcher> = runtime.dispatcher(registry);
 
         let compactor: Arc<dyn HistoryCompactor> =
@@ -101,6 +106,7 @@ impl HarnessApp {
                 lead,
                 provider_name,
                 model_name,
+                workspace,
                 session_dir,
             },
             approvals,

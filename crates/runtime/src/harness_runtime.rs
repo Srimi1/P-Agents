@@ -37,7 +37,7 @@ impl HarnessRuntime {
     ) -> Result<(Self, mpsc::Receiver<ApprovalRequest>)> {
         let yolo = yolo || security.is_yolo();
         let security = Arc::new(security.with_yolo(yolo));
-        let (gate, approvals) = ApprovalGate::new(yolo);
+        let (gate, approvals) = ApprovalGate::new(yolo, security.grant_scope());
         let bus = Arc::new(EventBus::new(BUS_CAPACITY));
 
         let store = SessionStore::create(session_dir, model).await?;

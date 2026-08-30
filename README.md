@@ -11,9 +11,10 @@ execution, and a replayable transcript of everything that happened.
 
 ## What it does
 
-- **Two native providers.** Anthropic's Messages API and any OpenAI-compatible
-  endpoint (OpenAI, Ollama, vLLM, LocalAI, DeepSeek, Gemini's compatibility
-  layer), both with real SSE streaming and token-usage accounting.
+- **Three providers.** Anthropic's Messages API natively, plus any
+  OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, LocalAI, DeepSeek) and
+  Gemini through its compatibility endpoint — all with SSE streaming and
+  token-usage accounting.
 - **Six personas.** A Lead Planner that decomposes goals and delegates, plus
   Software Engineer, Verifier, Egoist Critic, Researcher, and Data Analyst
   specialists. More can be added from a config file.
@@ -27,6 +28,10 @@ execution, and a replayable transcript of everything that happened.
   are gated behind a `[y/n/a]` prompt. The gate fails closed: no reachable
   approver means denied. A denial comes back to the model as an observation, so
   it adapts instead of crashing.
+- **Filesystem containment.** The file tools are confined to the working
+  directory by default. Reads are never prompted, so this — not the approval
+  gate — is what stops an agent reading `~/.ssh/id_rsa`. Symlinks are resolved
+  before the check, and it still applies under `--yolo`.
 - **Session persistence.** Every message and usage report is appended to
   `.harness/sessions/<id>.jsonl` as it happens, and `--resume` replays it.
 - **Context compaction.** Old tool observations are shrunk as the conversation
@@ -59,6 +64,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+Or Gemini:
+
+```bash
+export GEMINI_API_KEY="..."
+```
+
 Or use an OpenAI-compatible endpoint:
 
 ```bash
@@ -83,6 +94,12 @@ Interactive REPL:
 
 ```bash
 cargo run -p cli
+```
+
+Or install `harness` onto your PATH:
+
+```bash
+cargo install --path crates/cli
 ```
 
 One prompt, then exit:
@@ -129,7 +146,7 @@ file works but logs a warning.
 | Flag | Effect |
 | --- | --- |
 | `--prompt <text>` | Run once and exit instead of opening the REPL |
-| `--provider <name>` | `anthropic`, `openai`, or `mock` |
+| `--provider <name>` | `anthropic`, `openai`, `gemini`, or `mock` |
 | `--model <name>` | Override the configured model |
 | `--config <path>` | Use a specific config file |
 | `--yolo` | Approve every tool call without asking |
@@ -164,27 +181,30 @@ what keeps delegation one level deep rather than unbounded.
 | `find_files_by_name` | no | Glob against both file name and relative path |
 | `write_file` | yes | Creates parent directories |
 | `edit_file_block` | yes | Exact-match replacement; refuses ambiguous matches |
-| `run_bash_command` | yes | Timeout kills the child; optional background mode |
+| `run_bash_command` | yes | Timeout kills the whole process group; optional background mode |
+
+Every tool above except `run_bash_command` resolves its path against the
+workspace roots first and refuses anything outside them. `run_bash_command`
+only has its `cwd` checked — the command itself is unconstrained.
 
 ## Known limitations
 
 Worth knowing before you point this at something important.
 
-- **There is no filesystem sandbox.** The read-only tools will happily read any
-  path the process can reach, including `~/.ssh` and files outside the working
-  directory, and they do not prompt. The approval gate covers writing and shell
-  execution, not reading. Run the harness as a user that only has access to what
-  you are willing to expose.
-- **A session grant is per-tool, not per-agent.** Answering `a` to an approval
-  clears that tool for every agent, lead and sub-agents alike, until you exit.
-  Use `y` if you only meant this one call.
-- **Command timeouts kill the shell, not its descendants.** A timed-out
-  `run_bash_command` kills the `sh` it started; a grandchild that shell spawned
-  keeps running until it finishes on its own.
-- **Background commands are not fully detached.** They share the harness's
-  process group, so Ctrl-C in the terminal signals them too.
-- **`--yolo` disables the gate entirely**, including for sub-agents. It is for
-  CI and scripted runs.
+- **Shell commands are not confined.** Path containment bounds the file tools,
+  but nothing stops `cat ~/.ssh/id_rsa` inside `run_bash_command`. That tool is
+  controlled by requiring approval instead, so you see the command first — which
+  means **`--yolo` removes the only control on it**.
+- **Hard links defeat path containment**, by design: a hard link inside a root
+  is an equally real name for a file outside it, and no path-based check can
+  tell. Creating one requires prior access, and git cannot carry them.
+- **A grant's default scope is per-tool.** Answering `a` clears that tool for
+  every agent until you exit. Set `permissions.grant_scope = "agent"` to narrow
+  it to the agent that asked, at the cost of more prompts.
+- **Killing a command addresses its process group by pid**, which carries an
+  inherent narrow reuse race. Fully closing it needs cgroups or job objects.
+- **`--yolo` disables the approval gate entirely**, including for sub-agents.
+  Containment still applies. It is for CI and scripted runs.
 - **Nothing here has been exercised against a live API in this build.** Both
   providers are covered end-to-end against a loopback HTTP server that asserts
   the exact request they emit, but no real endpoint was contacted.

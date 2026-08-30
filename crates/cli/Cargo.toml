@@ -3,6 +3,8 @@ name = "cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Interactive multi-agent harness CLI"
 
 [lib]
 name = "cli"

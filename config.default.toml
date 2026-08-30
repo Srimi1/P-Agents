@@ -26,6 +26,12 @@ max_tokens = 8192
 # logs a warning, because config files get committed by accident.
 # api_key = "sk-ant-..."
 
+[provider.gemini]
+# Gemini speaks the OpenAI chat format on a compatibility endpoint, so it reuses
+# the same client. Key comes from GEMINI_API_KEY.
+model = "gemini-2.5-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
 [provider.openai]
 # Also covers Ollama, vLLM, LocalAI, DeepSeek, and Gemini's OpenAI-compatible
 # endpoint — point base_url at the server and use its model names.
@@ -47,6 +53,19 @@ auto_approve = ["read_file", "list_directory", "grep_search", "find_files_by_nam
 # Approve every tool call without asking. Intended for CI and scripted runs —
 # this lets agents write files and run shell commands unsupervised.
 yolo = false
+
+# Confine the file tools to workspace_roots. Reads are never gated by the
+# approval prompt, so turning this off lets an agent read any file the process
+# can reach. It also survives --yolo, which disables only the prompt.
+sandbox = true
+# Roots the file tools may touch. Empty means the working directory. Paths must
+# already exist; symlinks are resolved, so a link out of a root is refused.
+workspace_roots = []
+
+# How far an "always approve" answer reaches.
+#   "tool"  — that tool, for every agent, rest of the session (default)
+#   "agent" — that tool, only for the agent that was asked
+grant_scope = "tool"
 
 # Extra personas are merged into the roles spawn_subagent accepts, alongside the
 # six built-ins (planner, engineer, verifier, critic, researcher, analyst).

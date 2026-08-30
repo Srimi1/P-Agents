@@ -1,4 +1,6 @@
 use crate::tool_registry::Tool;
+use crate::tools::filesystem::{escapes_workspace, resolve_workspace_path};
+use crate::workspace::WorkspacePolicy;
 use agent_core::truncate_at_boundary;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -7,6 +9,7 @@ use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DEFAULT_GREP_MAX_RESULTS: usize = 100;
 const DEFAULT_FIND_MAX_RESULTS: usize = 200;
@@ -54,7 +57,7 @@ fn compile_glob(pattern: &str, key: &str) -> Result<GlobMatcher> {
         .compile_matcher())
 }
 
-fn walker(root: &Path) -> ignore::Walk {
+fn walker(root: &Path, policy: Arc<WorkspacePolicy>) -> ignore::Walk {
     let mut builder = WalkBuilder::new(root);
     // Mirrors ListDirTool's walk so the three tools agree on what exists:
     // dotfiles are searchable (.github, .env.example, .cargo/config.toml), only
@@ -70,8 +73,12 @@ fn walker(root: &Path) -> ignore::Walk {
         .git_ignore(true)
         .git_exclude(true)
         .require_git(false)
+        // Following links would let a link inside the root hand back paths from
+        // anywhere on disk; the containment filter below is the second line.
         .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(move |entry| {
+            entry.file_name() != ".git" && !escapes_workspace(&policy, entry.path())
+        })
         .sort_by_file_path(|a, b| a.cmp(b));
     builder.build()
 }
@@ -101,8 +108,8 @@ fn glob_matches(matcher: &GlobMatcher, rel: &str, path: &Path) -> bool {
     }
 }
 
-fn resolve_root(path_str: &str) -> Result<PathBuf> {
-    let root = PathBuf::from(path_str);
+fn resolve_root(policy: &WorkspacePolicy, path_str: &str) -> Result<PathBuf> {
+    let root = resolve_workspace_path(policy, path_str)?;
     if !root.exists() {
         anyhow::bail!("Path not found: {}", path_str);
     }
@@ -145,7 +152,21 @@ fn format_line(line: &str) -> String {
     }
 }
 
-pub struct GrepSearchTool;
+pub struct GrepSearchTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl GrepSearchTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for GrepSearchTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for GrepSearchTool {
@@ -208,14 +229,15 @@ impl Tool for GrepSearchTool {
             .build()
             .with_context(|| format!("Invalid regular expression: {}", pattern))?;
 
-        let root = resolve_root(&path_str)?;
+        let root = resolve_root(&self.policy, &path_str)?;
+        let policy = Arc::clone(&self.policy);
 
         let search_pattern = pattern.clone();
         tokio::task::spawn_blocking(move || {
             let mut lines: Vec<String> = Vec::new();
             let mut truncated = false;
 
-            'walk: for entry in walker(&root) {
+            'walk: for entry in walker(&root, policy) {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(_) => continue,
@@ -267,7 +289,21 @@ impl Tool for GrepSearchTool {
     }
 }
 
-pub struct FindFilesByNameTool;
+pub struct FindFilesByNameTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl FindFilesByNameTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for FindFilesByNameTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for FindFilesByNameTool {
@@ -309,12 +345,13 @@ impl Tool for FindFilesByNameTool {
         let path_str = optional_str(&args, "path", ".")?.to_string();
         let max_results = optional_limit(&args, "max_results", DEFAULT_FIND_MAX_RESULTS)?;
         let matcher = compile_glob(&pattern, "pattern")?;
-        let root = resolve_root(&path_str)?;
+        let root = resolve_root(&self.policy, &path_str)?;
+        let policy = Arc::clone(&self.policy);
 
         tokio::task::spawn_blocking(move || {
             let mut paths: Vec<String> = Vec::new();
 
-            for entry in walker(&root) {
+            for entry in walker(&root, policy) {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(_) => continue,
@@ -376,11 +413,15 @@ mod tests {
     }
 
     async fn grep(args: serde_json::Value) -> Result<String> {
-        GrepSearchTool.execute(args).await
+        GrepSearchTool::default().execute(args).await
     }
 
     async fn find(args: serde_json::Value) -> Result<String> {
-        FindFilesByNameTool.execute(args).await
+        FindFilesByNameTool::default().execute(args).await
+    }
+
+    fn confined(root: &Path) -> Arc<WorkspacePolicy> {
+        Arc::new(WorkspacePolicy::with_roots([root]).unwrap())
     }
 
     #[tokio::test]
@@ -694,9 +735,118 @@ mod tests {
 
     #[tokio::test]
     async fn search_tools_do_not_require_approval() {
-        assert!(!GrepSearchTool.requires_approval());
-        assert!(!FindFilesByNameTool.requires_approval());
-        assert_eq!(GrepSearchTool.name(), "grep_search");
-        assert_eq!(FindFilesByNameTool.name(), "find_files_by_name");
+        assert!(!GrepSearchTool::default().requires_approval());
+        assert!(!FindFilesByNameTool::default().requires_approval());
+        assert_eq!(GrepSearchTool::default().name(), "grep_search");
+        assert_eq!(FindFilesByNameTool::default().name(), "find_files_by_name");
+    }
+
+    #[tokio::test]
+    async fn grep_refuses_a_path_outside_the_workspace() {
+        let inside = fixture();
+        let outside = fixture();
+        let tool = GrepSearchTool::new(confined(inside.path()));
+
+        let err = tool
+            .execute(json!({ "pattern": "needle", "path": outside.path() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside the allowed workspace"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn find_refuses_a_path_outside_the_workspace() {
+        let inside = fixture();
+        let outside = fixture();
+        let tool = FindFilesByNameTool::new(confined(inside.path()));
+
+        let err = tool
+            .execute(json!({ "pattern": "*.rs", "path": outside.path() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside the allowed workspace"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn search_refuses_parent_traversal_with_a_retry_hint() {
+        let inside = fixture();
+        let escape = inside
+            .path()
+            .join("src/../../..")
+            .to_string_lossy()
+            .to_string();
+
+        let err = GrepSearchTool::new(confined(inside.path()))
+            .execute(json!({ "pattern": "needle", "path": escape }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("climb out of the workspace"), "{}", err);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn grep_does_not_leak_through_a_symlink_out_of_the_workspace() {
+        let inside = TempDir::new().unwrap();
+        write(inside.path(), "own.txt", "needle at home\n");
+        let outside = TempDir::new().unwrap();
+        write(outside.path(), "secret.txt", "needle in a secret\n");
+        std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
+
+        let out = GrepSearchTool::new(confined(inside.path()))
+            .execute(json!({ "pattern": "needle", "path": inside.path() }))
+            .await
+            .unwrap();
+
+        assert!(out.contains("own.txt:1: needle at home"), "{}", out);
+        assert!(!out.contains("secret"), "symlinked tree leaked: {}", out);
+        assert!(!out.contains("escape"), "symlinked tree leaked: {}", out);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn find_does_not_leak_through_a_symlink_out_of_the_workspace() {
+        let inside = TempDir::new().unwrap();
+        write(inside.path(), "own.rs", "");
+        let outside = TempDir::new().unwrap();
+        write(outside.path(), "secret.rs", "");
+        std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
+
+        let out = FindFilesByNameTool::new(confined(inside.path()))
+            .execute(json!({ "pattern": "**/*", "path": inside.path() }))
+            .await
+            .unwrap();
+
+        assert!(out.contains("own.rs"), "{}", out);
+        assert!(!out.contains("secret.rs"), "symlinked tree leaked: {}", out);
+    }
+
+    #[tokio::test]
+    async fn a_confined_search_still_works_inside_its_root() {
+        let dir = fixture();
+        let out = GrepSearchTool::new(confined(dir.path()))
+            .execute(json!({ "pattern": "needle", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert!(out.contains("src/main.rs:2: let needle = 1;"), "{}", out);
+
+        let found = FindFilesByNameTool::new(confined(dir.path()))
+            .execute(json!({ "pattern": "*.rs", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert_eq!(
+            found.lines().collect::<Vec<_>>(),
+            vec!["src/deep/mod.rs", "src/main.rs"]
+        );
     }
 }

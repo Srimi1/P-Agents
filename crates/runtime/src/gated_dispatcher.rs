@@ -111,10 +111,11 @@ impl ToolDispatcher for GatedDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::ApprovalRequest;
+    use crate::approval::{ApprovalRequest, GrantScope};
     use harness_core::Tool;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
 
     struct CountingTool {
@@ -179,6 +180,28 @@ mod tests {
         });
     }
 
+    /// Like `spawn_ui`, but records which agent each prompt was raised for.
+    fn spawn_recording_ui(
+        mut rx: mpsc::Receiver<ApprovalRequest>,
+        decision: ApprovalDecision,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                if let Ok(mut seen) = sink.lock() {
+                    seen.push(req.agent_id.clone());
+                }
+                let _ = req.respond.send(decision);
+            }
+        });
+        asked
+    }
+
+    fn asked_agents(asked: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        asked.lock().map(|seen| seen.clone()).unwrap_or_default()
+    }
+
     /// Registry with one dangerous tool and one safe tool; returns their counters.
     fn registry() -> (Arc<HarnessToolRegistry>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let dangerous = CountingTool::new("run_bash_command", true);
@@ -194,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn denial_becomes_an_ok_observation() {
         let (reg, dangerous_calls, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         let seen = Arc::new(AtomicUsize::new(0));
         spawn_ui(rx, ApprovalDecision::Deny, seen.clone());
 
@@ -213,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn approval_lets_the_tool_run() {
         let (reg, dangerous_calls, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         let seen = Arc::new(AtomicUsize::new(0));
         spawn_ui(rx, ApprovalDecision::Approve, seen.clone());
 
@@ -229,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn auto_approved_tool_never_reaches_the_gate() {
         let (reg, dangerous_calls, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         let seen = Arc::new(AtomicUsize::new(0));
         spawn_ui(rx, ApprovalDecision::Deny, seen.clone());
 
@@ -248,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn tool_that_does_not_require_approval_is_not_gated() {
         let (reg, _, safe_calls) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         let seen = Arc::new(AtomicUsize::new(0));
         spawn_ui(rx, ApprovalDecision::Deny, seen.clone());
 
@@ -267,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn yolo_security_bypasses_the_gate() {
         let (reg, dangerous_calls, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         drop(rx);
 
         let security = SecurityManager::new().with_yolo(true);
@@ -282,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn missing_ui_denies_rather_than_running_the_tool() {
         let (reg, dangerous_calls, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         drop(rx);
 
         let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
@@ -327,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn approval_emits_waiting_state_on_the_sink() {
         let (reg, _, _) = registry();
-        let (gate, rx) = ApprovalGate::new(false);
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
         let seen = Arc::new(AtomicUsize::new(0));
         spawn_ui(rx, ApprovalDecision::Approve, seen);
 
@@ -370,5 +393,79 @@ mod tests {
             .get_definitions()
             .iter()
             .any(|d| d.name == "read_file"));
+    }
+
+    #[tokio::test]
+    async fn agent_scope_session_grant_stops_at_the_granting_agent() {
+        let (reg, dangerous_calls, _) = registry();
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Agent);
+        let asked = spawn_recording_ui(rx, ApprovalDecision::ApproveForSession);
+
+        let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
+        for agent in ["lead", "lead", "engineer-1"] {
+            dispatcher
+                .dispatch(agent, &call("run_bash_command"))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(dangerous_calls.load(Ordering::SeqCst), 3);
+        // The second "lead" call rode the grant; "engineer-1" had to be asked,
+        // and was asked under its own identity rather than the lead's.
+        assert_eq!(asked_agents(&asked), vec!["lead", "engineer-1"]);
+    }
+
+    #[tokio::test]
+    async fn tool_scope_session_grant_covers_every_agent() {
+        let (reg, dangerous_calls, _) = registry();
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Tool);
+        let asked = spawn_recording_ui(rx, ApprovalDecision::ApproveForSession);
+
+        let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
+        for agent in ["lead", "engineer-1"] {
+            dispatcher
+                .dispatch(agent, &call("run_bash_command"))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(dangerous_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(asked_agents(&asked), vec!["lead"]);
+    }
+
+    #[tokio::test]
+    async fn missing_ui_denies_under_every_scope() {
+        for scope in [GrantScope::Tool, GrantScope::Agent] {
+            let (reg, dangerous_calls, _) = registry();
+            let (gate, rx) = ApprovalGate::new(false, scope);
+            drop(rx);
+
+            let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
+            let out = dispatcher
+                .dispatch("engineer-1", &call("run_bash_command"))
+                .await
+                .unwrap();
+            assert!(out.starts_with("DENIED by user"), "scope {scope:?}");
+            assert_eq!(dangerous_calls.load(Ordering::SeqCst), 0, "scope {scope:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn denial_grants_nothing_under_agent_scope() {
+        let (reg, dangerous_calls, _) = registry();
+        let (gate, rx) = ApprovalGate::new(false, GrantScope::Agent);
+        let asked = spawn_recording_ui(rx, ApprovalDecision::Deny);
+
+        let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
+        for agent in ["lead", "lead"] {
+            let out = dispatcher
+                .dispatch(agent, &call("run_bash_command"))
+                .await
+                .unwrap();
+            assert!(out.starts_with("DENIED by user"));
+        }
+
+        assert_eq!(dangerous_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(asked_agents(&asked), vec!["lead", "lead"]);
     }
 }

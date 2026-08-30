@@ -1,10 +1,12 @@
 use crate::tool_registry::Tool;
+use crate::workspace::{self, WorkspacePolicy};
 use agent_core::truncate_at_boundary;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 
 /// A single minified line must not be allowed to dominate the model's context.
@@ -22,7 +24,146 @@ fn require_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("Missing or non-string '{}' argument", key))
 }
 
-pub struct ReadFileTool;
+/// Bounds a tool-supplied path to the workspace. Shared with the search tools so
+/// both families refuse identically.
+///
+/// A `..` path gets an extra sentence: without it the model reads "outside the
+/// workspace" and tends to retry the same relative path from a different guess
+/// at the working directory.
+pub(crate) fn resolve_workspace_path(policy: &WorkspacePolicy, path: &str) -> Result<PathBuf> {
+    let resolved = match policy.resolve(path) {
+        Ok(resolved) => resolved,
+        Err(err) if workspace::has_parent_traversal(path) => {
+            return Err(anyhow::anyhow!(
+                "{} The '..' components in '{}' climb out of the workspace, so retrying \
+                 this path will fail again; name a path inside the workspace instead.",
+                err,
+                path
+            ))
+        }
+        Err(err) => return Err(err),
+    };
+    follow_dangling_links(policy, path, resolved)
+}
+
+/// A chain of broken links is a mistake, not something to keep chasing.
+const MAX_SYMLINK_HOPS: usize = 8;
+
+/// Re-checks the parts of a resolved path that canonicalization could not see.
+///
+/// `WorkspacePolicy::resolve` canonicalizes the deepest *existing* ancestor and
+/// re-appends the rest verbatim, so a path for a file about to be created can
+/// still be checked. A **dangling** symlink is invisible to that: `canonicalize`
+/// fails on it exactly as it fails on a name that does not exist, so the link
+/// survives into the resolved path unresolved and still inside the root — while
+/// `write_file` opening it follows it to wherever it points. A workspace holding
+/// a checked-out repository can carry such a link (git tracks symlinks), which
+/// turns `write_file` into "create any file anywhere on disk": a shell profile, a
+/// LaunchAgent, an `authorized_keys`. So resolve the link ourselves and put the
+/// target back through the policy.
+fn follow_dangling_links(
+    policy: &WorkspacePolicy,
+    requested: &str,
+    resolved: PathBuf,
+) -> Result<PathBuf> {
+    if policy.is_unrestricted() {
+        return Ok(resolved);
+    }
+
+    let mut current = resolved;
+    for _ in 0..MAX_SYMLINK_HOPS {
+        // The deepest component that exists at all; `symlink_metadata` describes
+        // the link itself rather than its target, which is the whole point here.
+        let existing = current.ancestors().find_map(|a| {
+            std::fs::symlink_metadata(a)
+                .ok()
+                .map(|m| (a.to_path_buf(), m))
+        });
+        let (existing, metadata) = match existing {
+            Some(found) => found,
+            // Nothing along the path exists; there is no link to follow.
+            None => return Ok(current),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+        if existing != current {
+            // A broken link partway along the path cannot be traversed by any
+            // filesystem call either, so there is nothing to prove containment for.
+            anyhow::bail!(
+                "path '{}' passes through '{}', a symlink whose target does not exist, so it \
+                 cannot be shown to stay inside the allowed workspace; name a real path inside \
+                 the workspace instead",
+                requested,
+                existing.display()
+            );
+        }
+
+        let target = std::fs::read_link(&current)
+            .with_context(|| format!("Failed to read the symlink '{}'", current.display()))?;
+        let absolute = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .join(target)
+        };
+        let absolute = absolute.to_str().map(str::to_owned).ok_or_else(|| {
+            anyhow::anyhow!(
+                "path '{}' is a symlink to a non-UTF-8 target, which cannot be checked against \
+                 the allowed workspace",
+                requested
+            )
+        })?;
+
+        current = policy.resolve(&absolute).map_err(|err| {
+            anyhow::anyhow!(
+                "path '{}' is a symlink pointing out of the workspace: {} Writing through it \
+                 would escape the workspace, so retrying this path will fail again.",
+                requested,
+                err
+            )
+        })?;
+    }
+
+    anyhow::bail!(
+        "path '{}' is a chain of more than {} symlinks, which cannot be checked against the \
+         allowed workspace; name a real path inside the workspace instead",
+        requested,
+        MAX_SYMLINK_HOPS
+    )
+}
+
+/// True when a walked entry cannot be proven to live inside the workspace. The
+/// walkers do not follow symlinks, but a link that was somehow descended into,
+/// or a root reached by an unusual route, must not be able to emit outside paths.
+pub(crate) fn escapes_workspace(policy: &WorkspacePolicy, path: &Path) -> bool {
+    if policy.is_unrestricted() {
+        return false;
+    }
+    match path.to_str() {
+        Some(path) => policy.resolve(path).is_err(),
+        // A path the policy cannot be handed is a path we cannot clear.
+        None => true,
+    }
+}
+
+pub struct ReadFileTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl ReadFileTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for ReadFileTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -57,9 +198,9 @@ impl Tool for ReadFileTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String> {
         let path_str = require_str(&args, "path")?;
-        let path = Path::new(path_str);
+        let path = resolve_workspace_path(&self.policy, path_str)?;
 
-        let metadata = fs::metadata(path)
+        let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("File not found: '{}'", path_str))?;
         if metadata.is_dir() {
@@ -79,7 +220,7 @@ impl Tool for ReadFileTool {
             );
         }
 
-        let content = fs::read_to_string(path)
+        let content = fs::read_to_string(&path)
             .await
             .with_context(|| format!("Failed to read '{}' as UTF-8 text", path_str))?;
 
@@ -140,7 +281,21 @@ impl Tool for ReadFileTool {
     }
 }
 
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl WriteFileTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for WriteFileTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for WriteFileTool {
@@ -177,7 +332,9 @@ impl Tool for WriteFileTool {
         let path_str = require_str(&args, "path")?;
         let content = require_str(&args, "content")?;
 
-        let path = Path::new(path_str);
+        // Resolution precedes every filesystem effect, so a refused path leaves
+        // neither the file nor its parent directories behind.
+        let path = resolve_workspace_path(&self.policy, path_str)?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await.with_context(|| {
@@ -186,14 +343,28 @@ impl Tool for WriteFileTool {
             }
         }
 
-        fs::write(path, content)
+        fs::write(&path, content)
             .await
             .with_context(|| format!("Failed to write '{}'", path_str))?;
         Ok(format!("Wrote {} bytes to '{}'", content.len(), path_str))
     }
 }
 
-pub struct ListDirTool;
+pub struct ListDirTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl ListDirTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for ListDirTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for ListDirTool {
@@ -238,7 +409,7 @@ impl Tool for ListDirTool {
             ),
         };
 
-        let root = PathBuf::from(&path_str);
+        let root = resolve_workspace_path(&self.policy, &path_str)?;
         let metadata = fs::metadata(&root)
             .await
             .with_context(|| format!("Directory not found: '{}'", path_str))?;
@@ -248,6 +419,7 @@ impl Tool for ListDirTool {
 
         let depth = if recursive { max_depth } else { Some(1) };
         let walk_root = root.clone();
+        let policy = Arc::clone(&self.policy);
 
         let (mut entries, total, skipped) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<(bool, String)>, usize, usize)> {
@@ -260,9 +432,13 @@ impl Tool for ListDirTool {
                     .git_exclude(true)
                     // .gitignore files apply even when the tree is not a git checkout.
                     .require_git(false)
+                    // A followed symlink could hand back paths from anywhere on
+                    // the disk, so links are listed but never descended into.
                     .follow_links(false)
                     .max_depth(depth)
-                    .filter_entry(|entry| entry.file_name() != ".git");
+                    .filter_entry(move |entry| {
+                        entry.file_name() != ".git" && !escapes_workspace(&policy, entry.path())
+                    });
 
                 let mut collected = Vec::new();
                 let mut skipped = 0usize;
@@ -331,7 +507,21 @@ impl Tool for ListDirTool {
     }
 }
 
-pub struct EditFileBlockTool;
+pub struct EditFileBlockTool {
+    policy: Arc<WorkspacePolicy>,
+}
+
+impl EditFileBlockTool {
+    pub fn new(policy: Arc<WorkspacePolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for EditFileBlockTool {
+    fn default() -> Self {
+        Self::new(Arc::new(WorkspacePolicy::unrestricted()))
+    }
+}
 
 #[async_trait]
 impl Tool for EditFileBlockTool {
@@ -385,8 +575,8 @@ impl Tool for EditFileBlockTool {
             anyhow::bail!("'old_string' and 'new_string' are identical; nothing to do");
         }
 
-        let path = Path::new(path_str);
-        let content = fs::read_to_string(path)
+        let path = resolve_workspace_path(&self.policy, path_str)?;
+        let content = fs::read_to_string(&path)
             .await
             .with_context(|| format!("Failed to read '{}' for editing", path_str))?;
 
@@ -411,7 +601,7 @@ impl Tool for EditFileBlockTool {
             (content.replacen(old_string, new_string, 1), 1)
         };
 
-        fs::write(path, &updated)
+        fs::write(&path, &updated)
             .await
             .with_context(|| format!("Failed to write '{}'", path_str))?;
 
@@ -437,7 +627,10 @@ mod tests {
         let file = path_of(&dir, "a.txt");
         std::fs::write(&file, "alpha\nbeta\n").unwrap();
 
-        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
+        let out = ReadFileTool::default()
+            .execute(json!({ "path": file }))
+            .await
+            .unwrap();
         assert_eq!(out, "1\talpha\n2\tbeta\n");
     }
 
@@ -448,7 +641,7 @@ mod tests {
         let body: String = (1..=10).map(|n| format!("line{}\n", n)).collect();
         std::fs::write(&file, body).unwrap();
 
-        let out = ReadFileTool
+        let out = ReadFileTool::default()
             .execute(json!({ "path": file.clone(), "offset": 3, "limit": 2 }))
             .await
             .unwrap();
@@ -469,7 +662,10 @@ mod tests {
         let file = path_of(&dir, "small.txt");
         std::fs::write(&file, "one\ntwo\n").unwrap();
 
-        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
+        let out = ReadFileTool::default()
+            .execute(json!({ "path": file }))
+            .await
+            .unwrap();
         assert!(!out.contains("Showed lines"), "{}", out);
     }
 
@@ -479,7 +675,7 @@ mod tests {
         let file = path_of(&dir, "short.txt");
         std::fs::write(&file, "only\n").unwrap();
 
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": file, "offset": 9 }))
             .await
             .unwrap_err()
@@ -492,7 +688,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = path_of(&dir, "nope.txt");
 
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": file }))
             .await
             .unwrap_err()
@@ -503,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn read_directory_errors() {
         let dir = tempdir().unwrap();
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy() }))
             .await
             .unwrap_err()
@@ -518,7 +714,10 @@ mod tests {
         let long_line = "あ".repeat(1000);
         std::fs::write(&file, format!("日本語テキスト\n{}\n", long_line)).unwrap();
 
-        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
+        let out = ReadFileTool::default()
+            .execute(json!({ "path": file }))
+            .await
+            .unwrap();
 
         assert!(out.contains("1\t日本語テキスト"), "{}", out);
         assert!(out.contains("[line truncated]"), "{}", out);
@@ -532,7 +731,7 @@ mod tests {
         let file = path_of(&dir, "x.txt");
         std::fs::write(&file, "a\n").unwrap();
 
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": file, "limit": 0 }))
             .await
             .unwrap_err()
@@ -545,14 +744,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = path_of(&dir, "nested/deeper/out.txt");
 
-        let out = WriteFileTool
+        let out = WriteFileTool::default()
             .execute(json!({ "path": file.clone(), "content": "hello" }))
             .await
             .unwrap();
 
         assert!(out.contains("5 bytes"), "{}", out);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
-        assert!(WriteFileTool.requires_approval());
+        assert!(WriteFileTool::default().requires_approval());
     }
 
     #[tokio::test]
@@ -560,7 +759,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = path_of(&dir, "out.txt");
 
-        let err = WriteFileTool
+        let err = WriteFileTool::default()
             .execute(json!({ "path": file }))
             .await
             .unwrap_err()
@@ -574,7 +773,7 @@ mod tests {
         let file = path_of(&dir, "code.rs");
         std::fs::write(&file, "let a = 1;\nlet b = 2;\n").unwrap();
 
-        let out = EditFileBlockTool
+        let out = EditFileBlockTool::default()
             .execute(json!({
                 "path": file.clone(),
                 "old_string": "let b = 2;",
@@ -588,7 +787,7 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "let a = 1;\nlet b = 3;\n"
         );
-        assert!(EditFileBlockTool.requires_approval());
+        assert!(EditFileBlockTool::default().requires_approval());
     }
 
     #[tokio::test]
@@ -598,7 +797,7 @@ mod tests {
         let original = "let a = 1;\n";
         std::fs::write(&file, original).unwrap();
 
-        let err = EditFileBlockTool
+        let err = EditFileBlockTool::default()
             .execute(json!({
                 "path": file.clone(),
                 "old_string": "let z = 9;",
@@ -620,7 +819,7 @@ mod tests {
         let original = "value\nvalue\n";
         std::fs::write(&file, original).unwrap();
 
-        let err = EditFileBlockTool
+        let err = EditFileBlockTool::default()
             .execute(json!({
                 "path": file.clone(),
                 "old_string": "value",
@@ -641,7 +840,7 @@ mod tests {
         let file = path_of(&dir, "code.rs");
         std::fs::write(&file, "value\nvalue\n").unwrap();
 
-        let out = EditFileBlockTool
+        let out = EditFileBlockTool::default()
             .execute(json!({
                 "path": file.clone(),
                 "old_string": "value",
@@ -660,7 +859,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file = path_of(&dir, "absent.rs");
 
-        let err = EditFileBlockTool
+        let err = EditFileBlockTool::default()
             .execute(json!({
                 "path": file,
                 "old_string": "a",
@@ -678,7 +877,7 @@ mod tests {
         let file = path_of(&dir, "code.rs");
         std::fs::write(&file, "x\n").unwrap();
 
-        let err = EditFileBlockTool
+        let err = EditFileBlockTool::default()
             .execute(json!({
                 "path": file,
                 "old_string": "",
@@ -709,7 +908,7 @@ mod tests {
         let dir = tempdir().unwrap();
         build_tree(&dir);
 
-        let out = ListDirTool
+        let out = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy(), "recursive": true }))
             .await
             .unwrap();
@@ -728,7 +927,7 @@ mod tests {
         let dir = tempdir().unwrap();
         build_tree(&dir);
 
-        let shallow = ListDirTool
+        let shallow = ListDirTool::default()
             .execute(json!({
                 "path": dir.path().to_string_lossy(),
                 "recursive": true,
@@ -739,7 +938,7 @@ mod tests {
         assert!(shallow.contains("[DIR] src"), "{}", shallow);
         assert!(!shallow.contains("main.rs"), "{}", shallow);
 
-        let deeper = ListDirTool
+        let deeper = ListDirTool::default()
             .execute(json!({
                 "path": dir.path().to_string_lossy(),
                 "recursive": true,
@@ -756,7 +955,7 @@ mod tests {
         let dir = tempdir().unwrap();
         build_tree(&dir);
 
-        let out = ListDirTool
+        let out = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy() }))
             .await
             .unwrap();
@@ -770,12 +969,12 @@ mod tests {
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
 
-        let out = ListDirTool
+        let out = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy() }))
             .await
             .unwrap();
         assert_eq!(out, "[FILE] a.txt\n[FILE] b.txt");
-        assert_eq!(ListDirTool.name(), "list_directory");
+        assert_eq!(ListDirTool::default().name(), "list_directory");
     }
 
     #[tokio::test]
@@ -785,7 +984,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{:04}.txt", n)), "x").unwrap();
         }
 
-        let out = ListDirTool
+        let out = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy() }))
             .await
             .unwrap();
@@ -803,7 +1002,7 @@ mod tests {
         let file = path_of(&dir, "f.txt");
         std::fs::write(&file, "x").unwrap();
 
-        let err = ListDirTool
+        let err = ListDirTool::default()
             .execute(json!({ "path": file }))
             .await
             .unwrap_err()
@@ -822,7 +1021,7 @@ mod tests {
         std::fs::write(locked.join("inner.txt"), "y").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let res = ListDirTool
+        let res = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy(), "recursive": true }))
             .await;
         // Restore before asserting so the TempDir can always clean itself up.
@@ -842,7 +1041,7 @@ mod tests {
     async fn read_rejects_non_regular_file() {
         // /dev/zero reports len() == 0 and is neither a dir nor a regular file;
         // slurping it would allocate until the process dies.
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": "/dev/zero" }))
             .await
             .unwrap_err()
@@ -859,7 +1058,7 @@ mod tests {
         f.set_len(MAX_READ_BYTES + 1).unwrap();
         drop(f);
 
-        let err = ReadFileTool
+        let err = ReadFileTool::default()
             .execute(json!({ "path": file }))
             .await
             .unwrap_err()
@@ -867,10 +1066,318 @@ mod tests {
         assert!(err.contains("exceeds"), "{}", err);
     }
 
+    fn confined(root: &tempfile::TempDir) -> Arc<WorkspacePolicy> {
+        Arc::new(WorkspacePolicy::with_roots([root.path()]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn read_refuses_a_path_outside_the_workspace() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = path_of(&outside, "secret.txt");
+        std::fs::write(&secret, "sensitive").unwrap();
+
+        let err = ReadFileTool::new(confined(&inside))
+            .execute(json!({ "path": secret }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn read_still_works_inside_the_workspace() {
+        let inside = tempdir().unwrap();
+        let file = path_of(&inside, "a.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+
+        let out = ReadFileTool::new(confined(&inside))
+            .execute(json!({ "path": file }))
+            .await
+            .unwrap();
+        assert_eq!(out, "1\talpha\n");
+    }
+
+    #[tokio::test]
+    async fn write_refuses_outside_the_workspace_without_creating_anything() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("new/deep/planted.txt");
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({ "path": target.to_string_lossy(), "content": "x" }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+        assert!(!target.exists(), "a refused write must not create the file");
+        assert!(
+            !outside.path().join("new").exists(),
+            "a refused write must not create parent directories"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_refuses_parent_traversal_with_a_retry_hint() {
+        let inside = tempdir().unwrap();
+        let escape = inside.path().join("../planted.txt");
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({ "path": escape.to_string_lossy(), "content": "x" }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("climb out of the workspace"), "{}", err);
+        assert!(!escape.exists());
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_outside_the_workspace_and_leaves_the_file() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let file = path_of(&outside, "code.rs");
+        let original = "let a = 1;\n";
+        std::fs::write(&file, original).unwrap();
+
+        let err = EditFileBlockTool::new(confined(&inside))
+            .execute(json!({
+                "path": file.clone(),
+                "old_string": "let a = 1;",
+                "new_string": "let a = 2;"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn list_directory_refuses_a_path_outside_the_workspace() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "sensitive").unwrap();
+
+        let err = ListDirTool::new(confined(&inside))
+            .execute(json!({ "path": outside.path().to_string_lossy() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn list_directory_skips_a_symlink_that_leaves_the_workspace() {
+        let inside = tempdir().unwrap();
+        std::fs::write(inside.path().join("own.txt"), "mine").unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "sensitive").unwrap();
+        std::os::unix::fs::symlink(outside.path(), inside.path().join("escape")).unwrap();
+
+        let out = ListDirTool::new(confined(&inside))
+            .execute(json!({ "path": inside.path().to_string_lossy(), "recursive": true }))
+            .await
+            .unwrap();
+
+        assert!(out.contains("own.txt"), "{}", out);
+        assert!(!out.contains("escape"), "escaping link was listed: {}", out);
+        assert!(!out.contains("secret.txt"), "leaked contents: {}", out);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_refuses_a_dangling_symlink_pointing_out_of_the_workspace() {
+        // `canonicalize` fails on a broken link exactly as it fails on a name that
+        // does not exist, so without an explicit check the link survives the
+        // containment test and `write_file` follows it out of the workspace.
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("planted.txt");
+        std::os::unix::fs::symlink(&victim, inside.path().join("link")).unwrap();
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({
+                "path": inside.path().join("link").to_string_lossy(),
+                "content": "pwned"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("out of the workspace"), "{}", err);
+        assert!(
+            !victim.exists(),
+            "a refused write must not create the target"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_refuses_a_relative_dangling_symlink_pointing_out_of_the_workspace() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("planted.txt");
+        let relative = Path::new("..")
+            .join(outside.path().file_name().unwrap())
+            .join("planted.txt");
+        std::os::unix::fs::symlink(&relative, inside.path().join("rel")).unwrap();
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({
+                "path": inside.path().join("rel").to_string_lossy(),
+                "content": "pwned"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("out of the workspace"), "{}", err);
+        assert!(
+            !victim.exists(),
+            "a relative link target must not be created"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_refuses_a_path_running_through_a_dangling_symlink() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("nodir"), inside.path().join("dl")).unwrap();
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({
+                "path": inside.path().join("dl/sub/f.txt").to_string_lossy(),
+                "content": "pwned"
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("passes through"), "{}", err);
+        assert!(!outside.path().join("nodir").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_still_follows_a_dangling_symlink_that_stays_inside_the_workspace() {
+        // Refusing every broken link would be over-broad: one whose target is
+        // inside the workspace is a perfectly ordinary thing to write through.
+        let inside = tempdir().unwrap();
+        std::fs::create_dir_all(inside.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(
+            inside.path().join("sub/new.txt"),
+            inside.path().join("link"),
+        )
+        .unwrap();
+
+        WriteFileTool::new(confined(&inside))
+            .execute(json!({
+                "path": inside.path().join("link").to_string_lossy(),
+                "content": "ok"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(inside.path().join("sub/new.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_symlink_loop_is_refused_instead_of_followed_forever() {
+        let inside = tempdir().unwrap();
+        std::os::unix::fs::symlink(inside.path().join("b"), inside.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(inside.path().join("a"), inside.path().join("b")).unwrap();
+
+        let err = WriteFileTool::new(confined(&inside))
+            .execute(json!({ "path": inside.path().join("a").to_string_lossy(), "content": "x" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("chain of more than"), "{}", err);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn read_refuses_a_symlink_to_a_file_outside_the_workspace() {
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "sensitive\n").unwrap();
+        std::os::unix::fs::symlink(&secret, inside.path().join("s.txt")).unwrap();
+
+        let err = ReadFileTool::new(confined(&inside))
+            .execute(json!({ "path": inside.path().join("s.txt").to_string_lossy() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+
+        // The walk must not surface it either.
+        let listed = ListDirTool::new(confined(&inside))
+            .execute(json!({ "path": inside.path().to_string_lossy(), "recursive": true }))
+            .await
+            .unwrap();
+        assert!(
+            !listed.contains("s.txt"),
+            "escaping link was listed: {}",
+            listed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_root_sharing_a_name_prefix_is_not_inside_the_workspace() {
+        // The classic string-prefix hole: "/home/user2" starts with "/home/user".
+        let base = tempdir().unwrap();
+        let ws = base.path().join("ws");
+        let evil = base.path().join("ws-evil");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(evil.join("secret.txt"), "sensitive").unwrap();
+
+        let policy = Arc::new(WorkspacePolicy::with_roots([&ws]).unwrap());
+        let err = ReadFileTool::new(policy)
+            .execute(json!({ "path": evil.join("secret.txt").to_string_lossy() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed workspace"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn escapes_workspace_judges_entries_against_the_roots() {
+        // Pins the walk filter directly: with follow_links(false) the walkers
+        // never hand it an outside path, so nothing else can catch a regression.
+        let inside = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(inside.path().join("own.txt"), "mine").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "sensitive").unwrap();
+
+        let policy = WorkspacePolicy::with_roots([inside.path()]).unwrap();
+        assert!(!escapes_workspace(&policy, &inside.path().join("own.txt")));
+        assert!(escapes_workspace(
+            &policy,
+            &outside.path().join("secret.txt")
+        ));
+
+        let open = WorkspacePolicy::unrestricted();
+        assert!(!escapes_workspace(
+            &open,
+            &outside.path().join("secret.txt")
+        ));
+    }
+
     #[tokio::test]
     async fn list_directory_reports_empty_tree() {
         let dir = tempdir().unwrap();
-        let out = ListDirTool
+        let out = ListDirTool::default()
             .execute(json!({ "path": dir.path().to_string_lossy() }))
             .await
             .unwrap();

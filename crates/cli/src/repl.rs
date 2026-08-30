@@ -3,7 +3,7 @@ use agent_core::TokenUsage;
 use anyhow::Result;
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use runtime::{ApprovalDecision, ApprovalRequest, HarnessEvent};
+use runtime::{ApprovalDecision, ApprovalRequest, GrantScope, HarnessEvent};
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -675,10 +675,14 @@ async fn prompt_for_approval(request: &ApprovalRequest, lines: &Lines) -> Approv
         Err(_) => println!("  {}", request.arguments.to_string().dimmed()),
     }
     println!("{}", rule.yellow());
-    print!(
-        "{} ",
-        "allow? [y]es / [n]o / [a]lways (this tool, any agent, rest of session):".bold()
-    );
+    // The prompt must describe the grant the answer really creates; saying
+    // "any agent" under Agent scope would be asking for consent to something
+    // broader than what is granted.
+    let always = match request.scope {
+        GrantScope::Agent => "[a]lways (this tool, this agent, rest of session)",
+        GrantScope::Tool => "[a]lways (this tool, ANY agent, rest of session)",
+    };
+    print!("{} ", format!("allow? [y]es / [n]o / {always}:").bold());
     let _ = io::stdout().flush();
     let asked_at = Instant::now();
 

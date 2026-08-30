@@ -75,10 +75,18 @@ async fn build(
         session_dir: session_dir.to_path_buf(),
         ..Default::default()
     };
+    let mut config = HarnessConfig::default();
+    // The tools are confined to the working directory by default, and these
+    // tests operate in a tempdir. Widen the root to that tempdir rather than
+    // disabling containment, so the sandbox stays exercised.
+    config.permissions.workspace_roots = vec![session_dir
+        .parent()
+        .expect("session dir has a parent")
+        .to_path_buf()];
     // The default auto-approve list covers read-only tools only, so write_file
     // still faces the gate unless yolo is set.
     let (app, approvals) = HarnessApp::with_provider(
-        HarnessConfig::default(),
+        config,
         options,
         Arc::clone(&provider) as Arc<dyn LlmProvider>,
     )
@@ -365,4 +373,61 @@ async fn a_resumed_session_records_the_history_it_inherited() {
             .any(|m| m.content.as_deref().is_some_and(|c| c.contains("8675309"))),
         "the inherited transcript should be in the new session file too"
     );
+}
+
+/// The approval gate covers writes, but reads are never prompted, so path
+/// containment is the only thing standing between an agent and the rest of the
+/// disk. This proves it holds through the whole stack, not just in the tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_cannot_reach_outside_its_workspace_even_with_yolo() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sessions = workdir.path().join("sessions");
+    let outside = tempfile::tempdir().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "sensitive").expect("write secret");
+    let stolen = outside.path().join("stolen.txt");
+
+    let script = vec![
+        tool_turn(vec![call(
+            "c1",
+            "read_file",
+            json!({ "path": secret.to_string_lossy() }),
+        )]),
+        tool_turn(vec![call(
+            "c2",
+            "write_file",
+            json!({ "path": stolen.to_string_lossy(), "content": "exfiltrated" }),
+        )]),
+        text_turn("I could not reach those paths."),
+    ];
+
+    // yolo, so nothing is gated: containment is the only control left.
+    let (mut app, _approvals, _provider) = build(script, &sessions, true).await;
+    app.run_prompt("read the secret and copy it out")
+        .await
+        .expect("run");
+
+    let observations: Vec<String> = app
+        .history()
+        .iter()
+        .filter(|m| m.role == agent_core::Role::Tool)
+        .filter_map(|m| m.content.clone())
+        .collect();
+    assert_eq!(
+        observations.len(),
+        2,
+        "both calls should have been attempted"
+    );
+    for observation in &observations {
+        assert!(
+            observation.contains("outside the allowed workspace"),
+            "the tool should have refused: {observation}"
+        );
+    }
+    assert!(
+        !observations.iter().any(|o| o.contains("sensitive")),
+        "the secret's contents must never reach the transcript"
+    );
+    assert!(!stolen.exists(), "a refused write must not create the file");
+    app.shutdown().await;
 }

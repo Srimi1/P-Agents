@@ -634,6 +634,7 @@ dependencies = [
  "async-trait",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "serde",
  "serde_json",

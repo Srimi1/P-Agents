@@ -27,6 +27,19 @@ pub fn make_provider(
                     .with_max_tokens(config.provider.anthropic.max_tokens),
             ))
         }
+        // Gemini exposes an OpenAI-compatible chat endpoint, so it needs the
+        // same client with a different base URL and key.
+        "gemini" => {
+            let key = config.api_key_for("gemini").ok_or_else(|| {
+                anyhow::anyhow!("No Gemini API key. Set GEMINI_API_KEY, or pick another provider.")
+            })?;
+            let model = override_model.unwrap_or(&config.provider.gemini.model);
+            Ok(Arc::new(GenericOpenAiProvider::new(
+                key,
+                config.provider.gemini.base_url.clone(),
+                model,
+            )))
+        }
         // `GenericOpenAiProvider::provider_name()` reports "openai_compatible",
         // and `/model <name>` feeds that name straight back in here.
         "openai" | "openai_compatible" => {
@@ -45,7 +58,7 @@ pub fn make_provider(
             )))
         }
         other => anyhow::bail!(
-            "Unknown provider '{}'. Expected 'anthropic', 'openai', or 'mock'.",
+            "Unknown provider '{}'. Expected 'anthropic', 'openai', 'gemini', or 'mock'.",
             other
         ),
     }
@@ -135,9 +148,19 @@ mod tests {
     }
 
     #[test]
+    fn gemini_uses_the_openai_client_against_googles_endpoint() {
+        let mut config = HarnessConfig::default();
+        config.provider.gemini.api_key = Some("test-key".to_string());
+        let provider = make_provider(&config, Some("gemini"), None).unwrap();
+        // It is the OpenAI-compatible client underneath, pointed elsewhere.
+        assert_eq!(provider.provider_name(), "openai_compatible");
+        assert_eq!(provider.model_name(), config.provider.gemini.model);
+    }
+
+    #[test]
     fn unknown_provider_is_rejected() {
         let config = HarnessConfig::default();
-        let err = expect_err(make_provider(&config, Some("gemini"), None));
+        let err = expect_err(make_provider(&config, Some("hal9000"), None));
         assert!(err.contains("Unknown provider"));
     }
 
