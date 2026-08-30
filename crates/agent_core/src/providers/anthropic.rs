@@ -14,6 +14,10 @@ pub const DEFAULT_MAX_TOKENS: usize = 8192;
 /// Upper bound on how much of an error body is echoed back to the caller.
 const MAX_ERROR_BODY_BYTES: usize = 2048;
 
+/// Stand-in for a tool that returned nothing. Anthropic rejects blank content
+/// blocks, so a silent-but-successful tool needs a body of some kind.
+const EMPTY_TOOL_RESULT: &str = "(tool produced no output)";
+
 /// Native Anthropic Messages API provider.
 pub struct AnthropicProvider {
     pub api_key: String,
@@ -24,7 +28,11 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
@@ -154,10 +162,20 @@ fn to_wire(messages: &[ChatMessage]) -> Result<(Option<String>, Vec<Value>)> {
                         message.name.as_deref().unwrap_or("<unnamed>")
                     )
                 })?;
+                // A `tool_result` whose content is blank is rejected by the API
+                // ("text content blocks must be non-empty"), and a tool that
+                // succeeded silently — a write, a grep with no matches — is a
+                // routine occurrence. Send a marker so one quiet tool cannot
+                // 400 the whole conversation.
+                let content = if text.trim().is_empty() {
+                    EMPTY_TOOL_RESULT
+                } else {
+                    text
+                };
                 pending_tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": text,
+                    "content": content,
                 }));
             }
             Role::User => {
@@ -287,7 +305,11 @@ pub(crate) fn handle_sse_event(
         }
         "content_block_start" => {
             let index = block_index(&payload, kind)?;
-            if payload.pointer("/content_block/type").and_then(Value::as_str) != Some("tool_use") {
+            if payload
+                .pointer("/content_block/type")
+                .and_then(Value::as_str)
+                != Some("tool_use")
+            {
                 return Ok(Vec::new());
             }
             let id = payload
@@ -400,14 +422,15 @@ where
                             (events, state, queue, ended),
                         ));
                     }
-                    Some(Ok(event)) => match handle_sse_event(&event.event, &event.data, &mut state)
-                    {
-                        Ok(produced) => queue.extend(produced),
-                        Err(e) => {
-                            ended = true;
-                            return Some((Err(e), (events, state, queue, ended)));
+                    Some(Ok(event)) => {
+                        match handle_sse_event(&event.event, &event.data, &mut state) {
+                            Ok(produced) => queue.extend(produced),
+                            Err(e) => {
+                                ended = true;
+                                return Some((Err(e), (events, state, queue, ended)));
+                            }
                         }
-                    },
+                    }
                 }
             }
         },
@@ -580,7 +603,11 @@ mod tests {
             ChatMessage::tool_response("toolu_b", "read_file", "contents of b"),
         ];
         let (_, messages) = to_wire(&history).unwrap();
-        assert_eq!(messages.len(), 3, "parallel results must collapse into one user turn");
+        assert_eq!(
+            messages.len(),
+            3,
+            "parallel results must collapse into one user turn"
+        );
         assert_eq!(
             messages[2],
             json!({
@@ -606,7 +633,10 @@ mod tests {
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
-        assert_eq!(messages[3], json!({"role":"assistant","content":"Found two files."}));
+        assert_eq!(
+            messages[3],
+            json!({"role":"assistant","content":"Found two files."})
+        );
     }
 
     #[test]
@@ -617,6 +647,28 @@ mod tests {
         ];
         let (_, messages) = to_wire(&history).unwrap();
         assert_eq!(messages[1]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn to_wire_substitutes_a_marker_for_blank_tool_output() {
+        // A tool that succeeds silently is routine; a blank content block is a
+        // 400 from the API, so the whole conversation would die on it.
+        let history = vec![
+            ChatMessage::user("write it"),
+            ChatMessage::assistant_tool_calls(vec![tool_call("toolu_a", "write_file", json!({}))]),
+            ChatMessage::tool_response("toolu_a", "write_file", ""),
+            ChatMessage::assistant_tool_calls(vec![tool_call("toolu_b", "grep", json!({}))]),
+            ChatMessage::tool_response("toolu_b", "grep", "   \n "),
+        ];
+        let (_, messages) = to_wire(&history).unwrap();
+        for idx in [2usize, 4] {
+            let content = messages[idx]["content"][0]["content"].as_str().unwrap();
+            assert!(
+                !content.trim().is_empty(),
+                "tool_result at {idx} must not be blank: {messages:?}"
+            );
+            assert_eq!(content, EMPTY_TOOL_RESULT);
+        }
     }
 
     #[test]
@@ -662,15 +714,19 @@ mod tests {
 
     #[test]
     fn build_body_uses_input_schema_and_required_max_tokens() {
-        let provider =
-            AnthropicProvider::new("k", DEFAULT_ANTHROPIC_BASE_URL, "claude-x").with_max_tokens(512);
+        let provider = AnthropicProvider::new("k", DEFAULT_ANTHROPIC_BASE_URL, "claude-x")
+            .with_max_tokens(512);
         let tools = vec![ToolDefinition {
             name: "read_file".into(),
             description: "Reads a file".into(),
             parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
         }];
         let body = provider
-            .build_body(&[ChatMessage::system("sys"), ChatMessage::user("hi")], &tools, Some(0.3))
+            .build_body(
+                &[ChatMessage::system("sys"), ChatMessage::user("hi")],
+                &tools,
+                Some(0.3),
+            )
             .unwrap();
 
         assert_eq!(body["model"], "claude-x");
@@ -720,7 +776,11 @@ mod tests {
     #[tokio::test]
     async fn text_transcript_emits_deltas_and_usage_in_order() {
         let events = drive(chunks(TEXT_TRANSCRIPT, 9)).await.unwrap();
-        assert_eq!(events.len(), 4, "two text deltas, one usage, one done: {events:?}");
+        assert_eq!(
+            events.len(),
+            4,
+            "two text deltas, one usage, one done: {events:?}"
+        );
         assert_eq!(events[0], StreamEvent::TextDelta("Hello".into()));
         assert_eq!(events[1], StreamEvent::TextDelta(", world".into()));
         assert_eq!(events[2], StreamEvent::Usage(TokenUsage::new(25, 12)));
@@ -756,7 +816,9 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallArgsDelta { json_fragment, .. } => Some(json_fragment.as_str()),
+                StreamEvent::ToolCallArgsDelta { json_fragment, .. } => {
+                    Some(json_fragment.as_str())
+                }
                 _ => None,
             })
             .collect();
@@ -788,8 +850,13 @@ mod tests {
     #[tokio::test]
     async fn transport_errors_surface_as_err() {
         let parts = vec![
-            Ok(bytes::Bytes::from("event: ping\ndata: {\"type\":\"ping\"}\n\n")),
-            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")),
+            Ok(bytes::Bytes::from(
+                "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
         ];
         let raw = futures::stream::iter(parts);
         let mut stream = sse_bytes_to_stream(raw);
@@ -862,7 +929,8 @@ mod tests {
     #[test]
     fn events_after_message_stop_are_ignored() {
         let mut state = SseState::default();
-        let done = handle_sse_event("message_stop", r#"{"type":"message_stop"}"#, &mut state).unwrap();
+        let done =
+            handle_sse_event("message_stop", r#"{"type":"message_stop"}"#, &mut state).unwrap();
         assert_eq!(done.len(), 1);
         assert!(handle_sse_event(
             "content_block_delta",
@@ -883,7 +951,8 @@ mod tests {
         )
         .unwrap();
         assert!(produced.is_empty());
-        let done = handle_sse_event("message_stop", r#"{"type":"message_stop"}"#, &mut state).unwrap();
+        let done =
+            handle_sse_event("message_stop", r#"{"type":"message_stop"}"#, &mut state).unwrap();
         match &done[0] {
             StreamEvent::Done(resp) => assert_eq!(resp.stop_reason.as_deref(), Some("max_tokens")),
             other => panic!("expected Done, got {other:?}"),

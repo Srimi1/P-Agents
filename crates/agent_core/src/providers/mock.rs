@@ -80,11 +80,12 @@ impl MockProvider {
 
     fn next_response(&self, messages: &[ChatMessage]) -> Result<LlmResponse> {
         self.recorded.lock().unwrap().push(messages.to_vec());
-        self.script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| anyhow::anyhow!("MockProvider script exhausted after {} call(s)", self.call_count()))
+        self.script.lock().unwrap().pop_front().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MockProvider script exhausted after {} call(s)",
+                self.call_count()
+            )
+        })
     }
 }
 
@@ -146,7 +147,10 @@ mod tests {
     #[tokio::test]
     async fn streams_text_in_chunks_then_done() {
         let provider = MockProvider::with_text("hello world").with_chunk_size(4);
-        let mut stream = provider.stream(&[ChatMessage::user("hi")], &[], None).await.unwrap();
+        let mut stream = provider
+            .stream(&[ChatMessage::user("hi")], &[], None)
+            .await
+            .unwrap();
 
         let mut deltas = Vec::new();
         let mut done = None;
@@ -165,18 +169,33 @@ mod tests {
     #[tokio::test]
     async fn complete_drains_the_stream() {
         let provider = MockProvider::with_text("done");
-        let resp = provider.complete(&[ChatMessage::user("hi")], &[], None).await.unwrap();
+        let resp = provider
+            .complete(&[ChatMessage::user("hi")], &[], None)
+            .await
+            .unwrap();
         assert_eq!(resp.content.as_deref(), Some("done"));
     }
 
     #[tokio::test]
     async fn records_requests_for_isolation_assertions() {
         let provider = MockProvider::new(vec![
-            LlmResponse { content: Some("a".into()), ..Default::default() },
-            LlmResponse { content: Some("b".into()), ..Default::default() },
+            LlmResponse {
+                content: Some("a".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("b".into()),
+                ..Default::default()
+            },
         ]);
-        provider.complete(&[ChatMessage::user("first")], &[], None).await.unwrap();
-        provider.complete(&[ChatMessage::user("second")], &[], None).await.unwrap();
+        provider
+            .complete(&[ChatMessage::user("first")], &[], None)
+            .await
+            .unwrap();
+        provider
+            .complete(&[ChatMessage::user("second")], &[], None)
+            .await
+            .unwrap();
 
         assert_eq!(provider.call_count(), 2);
         assert!(provider.all_seen_text().contains("first"));
@@ -186,7 +205,10 @@ mod tests {
     #[tokio::test]
     async fn exhausted_script_is_an_error_not_a_panic() {
         let provider = MockProvider::new(vec![]);
-        let err = provider.complete(&[ChatMessage::user("hi")], &[], None).await.unwrap_err();
+        let err = provider
+            .complete(&[ChatMessage::user("hi")], &[], None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("script exhausted"));
     }
 }

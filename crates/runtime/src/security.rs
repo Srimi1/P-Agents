@@ -25,8 +25,7 @@ impl SecurityManager {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.auto_approved
-            .extend(tools.into_iter().map(Into::into));
+        self.auto_approved.extend(tools.into_iter().map(Into::into));
         self
     }
 

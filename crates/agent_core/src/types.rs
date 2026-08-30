@@ -72,10 +72,7 @@ impl ChatMessage {
 
     /// An assistant turn that produced both prose and tool calls. Anthropic emits
     /// these routinely; OpenAI can too when the model narrates before calling.
-    pub fn assistant_with_tool_calls(
-        content: Option<String>,
-        tool_calls: Vec<ToolCall>,
-    ) -> Self {
+    pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.filter(|c| !c.is_empty()),

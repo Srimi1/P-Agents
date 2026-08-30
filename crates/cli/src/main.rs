@@ -1,13 +1,9 @@
-mod repl;
-
-use agent_core::ToolDispatcher;
 use anyhow::Result;
 use clap::Parser;
+use cli::app::{AppOptions, HarnessApp, SESSION_DIR};
 use cli::config::HarnessConfig;
-use cli::provider_factory::make_provider;
-use repl::start_interactive_repl;
-use std::sync::Arc;
-use subagents::{build_tool_registry, MultiAgentOrchestrator};
+use cli::repl::{settle, start_repl};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -17,7 +13,11 @@ use tracing_subscriber::EnvFilter;
     about = "Universal Multi-Agent Harness in Rust"
 )]
 struct CliArgs {
-    #[arg(short, long, help = "Direct prompt to execute without entering the REPL")]
+    #[arg(
+        short,
+        long,
+        help = "Run one prompt and exit instead of opening the REPL"
+    )]
     prompt: Option<String>,
 
     #[arg(long, help = "Provider to use: anthropic, openai, or mock")]
@@ -27,41 +27,82 @@ struct CliArgs {
     model: Option<String>,
 
     #[arg(long, help = "Path to a config.toml, overriding the default location")]
-    config: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
 
-    #[arg(long, help = "Run the offline scripted mock provider")]
+    #[arg(long, help = "Approve every tool call without asking")]
+    yolo: bool,
+
+    #[arg(long, help = "Resume a previous session by id or id prefix")]
+    resume: Option<String>,
+
+    #[arg(long, help = "Use the offline scripted mock provider")]
     mock: bool,
+
+    #[arg(long, help = "Directory for session transcripts", default_value = SESSION_DIR)]
+    session_dir: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to warn so tracing lines don't fight with the REPL's own output;
+    // RUST_LOG still overrides it.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
         .init();
 
     let args = CliArgs::parse();
     let config = HarnessConfig::load(args.config.as_deref())?;
 
-    let provider_name = if args.mock {
-        Some("mock")
-    } else {
-        args.provider.as_deref()
+    let options = AppOptions {
+        provider: if args.mock {
+            Some("mock".to_string())
+        } else {
+            args.provider.clone()
+        },
+        model: args.model.clone(),
+        yolo: args.yolo,
+        session_dir: args.session_dir.clone(),
     };
-    let provider = make_provider(&config, provider_name, args.model.as_deref())?;
 
-    let orchestrator = MultiAgentOrchestrator::new(provider)
-        .with_max_parallel(config.limits.max_parallel_subagents)
-        .with_max_iterations(config.limits.max_iterations);
+    let (mut app, approvals) = HarnessApp::new(config, options).await?;
 
-    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(build_tool_registry());
+    if let Some(id) = &args.resume {
+        let restored = app.resume(&args.session_dir, id).await?;
+        println!("Restored {restored} messages from session {id}.");
+    }
 
-    if let Some(prompt) = args.prompt {
-        let mut lead_agent = orchestrator.create_lead_agent(dispatcher, None, None)?;
-        println!("Executing prompt: {}", prompt);
-        let result = lead_agent.run(&prompt).await?;
-        println!("\nResult:\n{}", result);
-    } else {
-        start_interactive_repl(orchestrator, dispatcher).await?;
+    match args.prompt {
+        Some(prompt) => {
+            // One-shot runs still need an approval responder, or a gated tool
+            // call would hang. Without a terminal to ask, deny by policy unless
+            // --yolo was passed.
+            let auto_deny = tokio::spawn(async move {
+                let mut approvals = approvals;
+                while let Some(request) = approvals.recv().await {
+                    eprintln!(
+                        "Denying '{}' from {}: non-interactive run without --yolo.",
+                        request.tool, request.agent_id
+                    );
+                    let _ = request.respond.send(runtime::ApprovalDecision::Deny);
+                }
+            });
+
+            let result = app.run_prompt(&prompt).await;
+            settle().await;
+            auto_deny.abort();
+            match result {
+                Ok(answer) => println!("\n{answer}"),
+                Err(err) => {
+                    app.shutdown().await;
+                    return Err(err);
+                }
+            }
+            app.shutdown().await;
+        }
+        None => start_repl(app, approvals).await?,
     }
 
     Ok(())

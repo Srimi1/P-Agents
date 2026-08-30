@@ -45,7 +45,12 @@ impl PersonaRegistry {
     }
 
     /// Adds or replaces a persona. Custom personas from `config.toml` land here.
-    pub fn insert(&mut self, role: impl Into<String>, display_name: impl Into<String>, prompt: impl Into<String>) {
+    pub fn insert(
+        &mut self,
+        role: impl Into<String>,
+        display_name: impl Into<String>,
+        prompt: impl Into<String>,
+    ) {
         let role = role.into();
         self.personas.insert(
             role,
@@ -92,7 +97,10 @@ mod tests {
         assert!(registry.roles().contains(&"dba".to_string()));
 
         registry.insert("critic", "Critic", "Custom critic prompt.");
-        assert_eq!(registry.get("critic").unwrap().prompt, "Custom critic prompt.");
+        assert_eq!(
+            registry.get("critic").unwrap().prompt,
+            "Custom critic prompt."
+        );
         assert_eq!(registry.roles().len(), 6);
     }
 

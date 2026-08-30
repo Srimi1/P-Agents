@@ -107,7 +107,10 @@ mod tests {
     /// `Arc<dyn LlmProvider>` is not `Debug`, so `unwrap_err` is unavailable.
     fn expect_err(result: Result<Arc<dyn LlmProvider>>) -> String {
         match result {
-            Ok(provider) => panic!("expected an error, got provider {}", provider.provider_name()),
+            Ok(provider) => panic!(
+                "expected an error, got provider {}",
+                provider.provider_name()
+            ),
             Err(err) => err.to_string(),
         }
     }

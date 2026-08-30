@@ -2,7 +2,7 @@ pub mod anthropic;
 pub mod mock;
 pub mod openai;
 
-use crate::types::{ChatMessage, LlmResponse, ToolCall, ToolDefinition, TokenUsage};
+use crate::types::{ChatMessage, LlmResponse, TokenUsage, ToolCall, ToolDefinition};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};

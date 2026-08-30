@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -184,19 +184,22 @@ async fn run_foreground(command_str: &str, cwd: &str, timeout_secs: u64) -> Resu
     let mut stderr_buf = Vec::new();
 
     // Both pipes must be drained while waiting, otherwise a command that fills the
-    // pipe buffer blocks forever instead of exiting.
+    // pipe buffer blocks forever instead of exiting. Draining is bounded: the pipes
+    // are read to completion but only the first MAX_OUTPUT_BYTES of each are kept,
+    // so `yes` (multiple GB/s through a pipe) cannot exhaust memory before the
+    // timeout fires.
     let collect = async {
-        let (_, _, status) = tokio::try_join!(
-            stdout_pipe.read_to_end(&mut stdout_buf),
-            stderr_pipe.read_to_end(&mut stderr_buf),
+        let (stdout_total, stderr_total, status) = tokio::try_join!(
+            drain_capped(&mut stdout_pipe, &mut stdout_buf, MAX_OUTPUT_BYTES),
+            drain_capped(&mut stderr_pipe, &mut stderr_buf, MAX_OUTPUT_BYTES),
             child.wait(),
         )?;
-        Ok::<_, std::io::Error>(status)
+        Ok::<_, std::io::Error>((stdout_total, stderr_total, status))
     };
 
     let outcome = timeout(Duration::from_secs(timeout_secs), collect).await;
 
-    let status = match outcome {
+    let (stdout_total, stderr_total, status) = match outcome {
         Ok(res) => res?,
         Err(_) => {
             // kill_on_drop would also reap it, but killing explicitly makes the
@@ -212,11 +215,40 @@ async fn run_foreground(command_str: &str, cwd: &str, timeout_secs: u64) -> Resu
 
     let stdout = String::from_utf8_lossy(&stdout_buf);
     let stderr = String::from_utf8_lossy(&stderr_buf);
-    Ok(format_output(status.code().unwrap_or(-1), &stdout, &stderr))
+    // The totals come from the pipes, not from the retained buffers, so the report
+    // stays honest about how much was thrown away.
+    Ok(format_output(
+        status.code().unwrap_or(-1),
+        &stdout,
+        &stderr,
+        stdout_total.saturating_add(stderr_total),
+    ))
 }
 
-fn format_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
-    let original_len = stdout.len() + stderr.len();
+/// Reads `reader` to EOF so the child never blocks on a full pipe, but retains at
+/// most `cap` bytes in `buf`. Returns the total number of bytes the stream
+/// produced, which may be far larger than what was retained.
+async fn drain_capped<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    let mut chunk = [0u8; 8192];
+    let mut total: usize = 0;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(n);
+        if buf.len() < cap {
+            let take = std::cmp::min(n, cap - buf.len());
+            buf.extend_from_slice(&chunk[..take]);
+        }
+    }
+}
+
+fn format_output(exit_code: i32, stdout: &str, stderr: &str, original_len: usize) -> String {
     let (stdout, stderr) = cap_output(stdout, stderr);
 
     let mut result = format!("Exit Code: {}\n", exit_code);
@@ -480,6 +512,54 @@ mod tests {
             .execute(json!({ "command": "echo hi", "background": "yes" }))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn drain_capped_retains_only_the_cap_but_reports_the_whole_stream() {
+        // 1 MiB of input through a 64-byte cap: a read_to_end-style implementation
+        // would retain all 1 MiB, which is exactly the runaway-memory failure mode.
+        let source = vec![b'x'; 1024 * 1024];
+        let mut reader = &source[..];
+        let mut buf = Vec::new();
+        let total = drain_capped(&mut reader, &mut buf, 64)
+            .await
+            .expect("draining a slice cannot fail");
+
+        assert_eq!(total, source.len());
+        assert_eq!(buf.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn runaway_output_does_not_get_buffered_whole() {
+        if !shell_available() {
+            return;
+        }
+        // 4 MiB emitted for real through the pipe; only the cap may survive.
+        let script = "s=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; \
+                      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; \
+                      do s=\"$s$s\"; done; printf '%s' \"$s\"";
+        let tool = BashCommandTool;
+        let out = tool
+            .execute(json!({ "command": script, "timeout_secs": 30 }))
+            .await
+            .expect("command should run");
+
+        assert!(out.contains("[output truncated:"), "{}", out);
+        assert!(out.contains("4194304 bytes"), "{}", out);
+        assert!(
+            out.len() < MAX_OUTPUT_BYTES + 512,
+            "capped output should stay near the budget, got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn kill_background_job_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        // Holding the BACKGROUND_JOBS std::sync guard across the `.await` would make
+        // this future !Send and risk deadlocking a multi-threaded runtime; the guard
+        // must stay a statement-scoped temporary.
+        assert_send(kill_background_job(0));
     }
 
     #[test]

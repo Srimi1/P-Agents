@@ -294,17 +294,14 @@ impl Tool for RunParallelSubAgentsTool {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((index, role, Ok(answer))) => {
-                    outcomes[index] = Some(format!("### Task {} ({})\n{}", index + 1, role, answer));
+                    outcomes[index] =
+                        Some(format!("### Task {} ({})\n{}", index + 1, role, answer));
                 }
                 // A failed sub-agent is reported to the model as a result, not
                 // propagated: the parent should be able to route around it.
                 Ok((index, role, Err(err))) => {
-                    outcomes[index] = Some(format!(
-                        "### Task {} ({}) FAILED\n{}",
-                        index + 1,
-                        role,
-                        err
-                    ));
+                    outcomes[index] =
+                        Some(format!("### Task {} ({}) FAILED\n{}", index + 1, role, err));
                 }
                 Err(join_err) => {
                     let slot = outcomes.iter().position(|o| o.is_none());

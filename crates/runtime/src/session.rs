@@ -195,7 +195,9 @@ mod tests {
     #[tokio::test]
     async fn create_writes_meta_and_round_trips_records() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = SessionStore::create(dir.path(), "claude-test").await.unwrap();
+        let mut store = SessionStore::create(dir.path(), "claude-test")
+            .await
+            .unwrap();
         let path = store.path().to_path_buf();
         assert!(path.starts_with(dir.path()));
         assert!(path.to_string_lossy().contains(store.session_id()));
@@ -321,7 +323,9 @@ mod tests {
         let exact = SessionStore::find_by_id(dir.path(), &id).await.unwrap();
         assert_eq!(exact, store.path());
 
-        let prefix = SessionStore::find_by_id(dir.path(), &id[..8]).await.unwrap();
+        let prefix = SessionStore::find_by_id(dir.path(), &id[..8])
+            .await
+            .unwrap();
         assert_eq!(prefix, store.path());
 
         assert!(SessionStore::find_by_id(dir.path(), "deadbeef")
@@ -332,8 +336,12 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_rejects_ambiguous_prefixes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        tokio::fs::write(dir.path().join("abc-1.jsonl"), "").await.unwrap();
-        tokio::fs::write(dir.path().join("abc-2.jsonl"), "").await.unwrap();
+        tokio::fs::write(dir.path().join("abc-1.jsonl"), "")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("abc-2.jsonl"), "")
+            .await
+            .unwrap();
         let err = SessionStore::find_by_id(dir.path(), "abc")
             .await
             .expect_err("ambiguous");

@@ -42,7 +42,10 @@ async fn spawn_subagent_returns_the_specialist_answer() {
         .await
         .expect("spawn should succeed");
 
-    assert!(out.contains("SoftwareEngineer"), "answer should name the persona: {out}");
+    assert!(
+        out.contains("SoftwareEngineer"),
+        "answer should name the persona: {out}"
+    );
     assert!(out.contains("Refactored the parser."));
 }
 
@@ -81,10 +84,17 @@ async fn subagent_context_is_isolated_from_the_parent() {
     let messages = &requests[0];
 
     // A sub-agent's opening context is exactly its persona plus its own task.
-    assert_eq!(messages.len(), 2, "unexpected sub-agent context: {messages:#?}");
+    assert_eq!(
+        messages.len(),
+        2,
+        "unexpected sub-agent context: {messages:#?}"
+    );
     assert_eq!(messages[0].role, Role::System);
     assert_eq!(messages[1].role, Role::User);
-    assert_eq!(messages[1].content.as_deref(), Some("Do the isolated thing."));
+    assert_eq!(
+        messages[1].content.as_deref(),
+        Some("Do the isolated thing.")
+    );
     assert!(
         !provider2.all_seen_text().contains(PARENT_SECRET),
         "parent history leaked into the sub-agent"
@@ -102,7 +112,10 @@ async fn unknown_role_is_reported_with_the_available_roles() {
         .expect_err("unknown role should error");
     let message = err.to_string();
     assert!(message.contains("wizard"), "{message}");
-    assert!(message.contains("engineer"), "should list valid roles: {message}");
+    assert!(
+        message.contains("engineer"),
+        "should list valid roles: {message}"
+    );
 }
 
 #[tokio::test]
@@ -116,8 +129,7 @@ async fn missing_task_parameter_errors() {
 async fn parallel_subagents_run_concurrently() {
     const DELAY_MS: u64 = 300;
     let provider = Arc::new(
-        MockProvider::new(text_responses(3, "finding"))
-            .with_delay(Duration::from_millis(DELAY_MS)),
+        MockProvider::new(text_responses(3, "finding")).with_delay(Duration::from_millis(DELAY_MS)),
     );
     let tool = RunParallelSubAgentsTool::new(factory(provider), 4);
 
@@ -134,7 +146,11 @@ async fn parallel_subagents_run_concurrently() {
         .expect("parallel run should succeed");
     let elapsed = started.elapsed();
 
-    assert_eq!(out.matches("### Task").count(), 3, "all three tasks report: {out}");
+    assert_eq!(
+        out.matches("### Task").count(),
+        3,
+        "all three tasks report: {out}"
+    );
     // Serial execution would take at least 3x the per-agent delay.
     assert!(
         elapsed < Duration::from_millis(DELAY_MS * 2),
@@ -185,7 +201,10 @@ async fn a_failing_subagent_does_not_fail_the_batch() {
         .await
         .expect("batch should succeed even when one sub-agent fails");
 
-    assert!(out.contains("FAILED"), "the failure should be reported: {out}");
+    assert!(
+        out.contains("FAILED"),
+        "the failure should be reported: {out}"
+    );
     assert_eq!(out.matches("### Task").count(), 3);
 }
 
@@ -212,13 +231,18 @@ async fn tool_schemas_advertise_only_registered_roles() {
     let roles = schema["properties"]["role"]["enum"]
         .as_array()
         .expect("role enum");
-    assert!(roles.iter().any(|r| r == "dba"), "custom persona missing: {roles:?}");
+    assert!(
+        roles.iter().any(|r| r == "dba"),
+        "custom persona missing: {roles:?}"
+    );
     assert!(roles.iter().any(|r| r == "engineer"));
 
     let parallel = RunParallelSubAgentsTool::new(factory, 2).parameters_schema();
-    assert!(parallel["properties"]["tasks"]["items"]["properties"]["role"]["enum"]
-        .as_array()
-        .expect("nested role enum")
-        .iter()
-        .any(|r| r == "dba"));
+    assert!(
+        parallel["properties"]["tasks"]["items"]["properties"]["role"]["enum"]
+            .as_array()
+            .expect("nested role enum")
+            .iter()
+            .any(|r| r == "dba")
+    );
 }

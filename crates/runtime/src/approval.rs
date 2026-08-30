@@ -97,7 +97,10 @@ impl ApprovalGate {
             }
             Ok(decision) => Ok(decision),
             Err(_) => {
-                warn!(tool, "Approval responder dropped without answering; denying");
+                warn!(
+                    tool,
+                    "Approval responder dropped without answering; denying"
+                );
                 Ok(ApprovalDecision::Deny)
             }
         }
@@ -161,7 +164,10 @@ mod tests {
         let (gate, rx) = ApprovalGate::new(false);
         let _ui = spawn_ui(rx, ApprovalDecision::Deny);
 
-        let decision = gate.request("lead", "write_file", &json!({})).await.unwrap();
+        let decision = gate
+            .request("lead", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(decision, ApprovalDecision::Deny);
         assert!(!gate.is_granted("write_file"));
     }
@@ -171,11 +177,17 @@ mod tests {
         let (gate, rx) = ApprovalGate::new(false);
         let ui = spawn_ui(rx, ApprovalDecision::ApproveForSession);
 
-        let first = gate.request("lead", "write_file", &json!({})).await.unwrap();
+        let first = gate
+            .request("lead", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(first, ApprovalDecision::ApproveForSession);
         assert!(gate.is_granted("write_file"));
 
-        let second = gate.request("sub-1", "write_file", &json!({})).await.unwrap();
+        let second = gate
+            .request("sub-1", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(second, ApprovalDecision::Approve);
         // A different tool is still gated.
         let third = gate
@@ -194,7 +206,10 @@ mod tests {
         let (gate, rx) = ApprovalGate::new(false);
         drop(rx);
 
-        let decision = gate.request("lead", "write_file", &json!({})).await.unwrap();
+        let decision = gate
+            .request("lead", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(decision, ApprovalDecision::Deny);
     }
 
@@ -206,7 +221,10 @@ mod tests {
             let _req = rx.recv().await;
         });
 
-        let decision = gate.request("lead", "write_file", &json!({})).await.unwrap();
+        let decision = gate
+            .request("lead", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(decision, ApprovalDecision::Deny);
     }
 
@@ -227,7 +245,10 @@ mod tests {
         let _ui = spawn_ui(rx, ApprovalDecision::ApproveForSession);
 
         let clone = gate.clone();
-        clone.request("sub-1", "write_file", &json!({})).await.unwrap();
+        clone
+            .request("sub-1", "write_file", &json!({}))
+            .await
+            .unwrap();
         assert!(gate.is_granted("write_file"));
     }
 }

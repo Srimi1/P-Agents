@@ -249,7 +249,10 @@ mod tests {
 
         let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate);
         assert_eq!(
-            dispatcher.dispatch("lead", &call("read_file")).await.unwrap(),
+            dispatcher
+                .dispatch("lead", &call("read_file"))
+                .await
+                .unwrap(),
             "read_file ran"
         );
         assert_eq!(safe_calls.load(Ordering::SeqCst), 1);
@@ -324,8 +327,8 @@ mod tests {
         spawn_ui(rx, ApprovalDecision::Approve, seen);
 
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
-        let dispatcher = GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate)
-            .with_events(tx);
+        let dispatcher =
+            GatedDispatcher::new(reg, Arc::new(SecurityManager::new()), gate).with_events(tx);
         dispatcher
             .dispatch("lead", &call("run_bash_command"))
             .await
@@ -346,8 +349,11 @@ mod tests {
     #[tokio::test]
     async fn get_definitions_delegates_to_the_registry() {
         let (reg, _, _) = registry();
-        let dispatcher =
-            GatedDispatcher::new(reg.clone(), Arc::new(SecurityManager::new()), ApprovalGate::yolo());
+        let dispatcher = GatedDispatcher::new(
+            reg.clone(),
+            Arc::new(SecurityManager::new()),
+            ApprovalGate::yolo(),
+        );
         let mut names: Vec<String> = dispatcher
             .get_definitions()
             .into_iter()

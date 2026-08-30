@@ -138,9 +138,7 @@ impl HarnessConfig {
     /// Loads defaults, then the config file if present, then environment
     /// overrides. A missing config file is normal, not an error.
     pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
-        let path = explicit_path
-            .map(PathBuf::from)
-            .or_else(Self::default_path);
+        let path = explicit_path.map(PathBuf::from).or_else(Self::default_path);
 
         let mut builder = ::config::Config::builder();
         // Serializing the defaults means every field has a value before any
@@ -189,7 +187,10 @@ impl HarnessConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if !matches!(self.provider.default.as_str(), "anthropic" | "openai" | "mock") {
+        if !matches!(
+            self.provider.default.as_str(),
+            "anthropic" | "openai" | "mock"
+        ) {
             anyhow::bail!(
                 "Unknown provider '{}'. Expected 'anthropic', 'openai', or 'mock'.",
                 self.provider.default

@@ -11,6 +11,10 @@ use tokio::fs;
 const MAX_LINE_BYTES: usize = 2000;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_LIST_ENTRIES: usize = 500;
+/// Whole-file read guard. `read_file` slurps the file before paging it, so without
+/// this a single huge file (or a character device such as /dev/zero, whose reported
+/// length is 0) can exhaust the harness's memory.
+const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 
 fn require_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str> {
     args[key]
@@ -60,6 +64,19 @@ impl Tool for ReadFileTool {
             .with_context(|| format!("File not found: '{}'", path_str))?;
         if metadata.is_dir() {
             anyhow::bail!("'{}' is a directory, not a file", path_str);
+        }
+        // Character devices, FIFOs and sockets are neither dirs nor regular files;
+        // reading them can block forever or never reach EOF.
+        if !metadata.is_file() {
+            anyhow::bail!("'{}' is not a regular file", path_str);
+        }
+        if metadata.len() > MAX_READ_BYTES {
+            anyhow::bail!(
+                "'{}' is {} bytes, which exceeds the {} byte read limit; use grep_search to locate the relevant region instead",
+                path_str,
+                metadata.len(),
+                MAX_READ_BYTES
+            );
         }
 
         let content = fs::read_to_string(path)
@@ -172,11 +189,7 @@ impl Tool for WriteFileTool {
         fs::write(path, content)
             .await
             .with_context(|| format!("Failed to write '{}'", path_str))?;
-        Ok(format!(
-            "Wrote {} bytes to '{}'",
-            content.len(),
-            path_str
-        ))
+        Ok(format!("Wrote {} bytes to '{}'", content.len(), path_str))
     }
 }
 
@@ -236,8 +249,8 @@ impl Tool for ListDirTool {
         let depth = if recursive { max_depth } else { Some(1) };
         let walk_root = root.clone();
 
-        let (mut entries, total) = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<(bool, String)>, usize)> {
+        let (mut entries, total, skipped) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<(bool, String)>, usize, usize)> {
                 let mut builder = WalkBuilder::new(&walk_root);
                 builder
                     .hidden(false)
@@ -252,8 +265,17 @@ impl Tool for ListDirTool {
                     .filter_entry(|entry| entry.file_name() != ".git");
 
                 let mut collected = Vec::new();
+                let mut skipped = 0usize;
                 for result in builder.build() {
-                    let entry = result?;
+                    // One unreadable subdirectory must not destroy the whole listing:
+                    // count it and keep walking rather than aborting.
+                    let entry = match result {
+                        Ok(entry) => entry,
+                        Err(_) => {
+                            skipped += 1;
+                            continue;
+                        }
+                    };
                     if entry.depth() == 0 {
                         continue;
                     }
@@ -267,14 +289,22 @@ impl Tool for ListDirTool {
 
                 collected.sort_by(|a, b| a.1.cmp(&b.1));
                 let total = collected.len();
-                Ok((collected, total))
-            },
-        )
-        .await
-        .context("Directory walk task failed")??;
+                Ok((collected, total, skipped))
+            })
+            .await
+            .context("Directory walk task failed")??;
+
+        let skipped_note = if skipped > 0 {
+            format!(
+                "\n\n[{} path(s) under '{}' could not be read and were skipped]",
+                skipped, path_str
+            )
+        } else {
+            String::new()
+        };
 
         if entries.is_empty() {
-            return Ok(format!("[No entries under '{}']", path_str));
+            return Ok(format!("[No entries under '{}']{}", path_str, skipped_note));
         }
 
         let truncated = entries.len() > MAX_LIST_ENTRIES;
@@ -295,6 +325,7 @@ impl Tool for ListDirTool {
                 MAX_LIST_ENTRIES, total, path_str
             ));
         }
+        out.push_str(&skipped_note);
 
         Ok(out)
     }
@@ -406,10 +437,7 @@ mod tests {
         let file = path_of(&dir, "a.txt");
         std::fs::write(&file, "alpha\nbeta\n").unwrap();
 
-        let out = ReadFileTool
-            .execute(json!({ "path": file }))
-            .await
-            .unwrap();
+        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
         assert_eq!(out, "1\talpha\n2\tbeta\n");
     }
 
@@ -428,7 +456,11 @@ mod tests {
         assert!(out.contains("3\tline3\n"), "{}", out);
         assert!(out.contains("4\tline4\n"), "{}", out);
         assert!(!out.contains("line5"), "{}", out);
-        assert!(out.contains("Showed lines 3-4 of 10 total lines"), "{}", out);
+        assert!(
+            out.contains("Showed lines 3-4 of 10 total lines"),
+            "{}",
+            out
+        );
     }
 
     #[tokio::test]
@@ -437,10 +469,7 @@ mod tests {
         let file = path_of(&dir, "small.txt");
         std::fs::write(&file, "one\ntwo\n").unwrap();
 
-        let out = ReadFileTool
-            .execute(json!({ "path": file }))
-            .await
-            .unwrap();
+        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
         assert!(!out.contains("Showed lines"), "{}", out);
     }
 
@@ -489,10 +518,7 @@ mod tests {
         let long_line = "あ".repeat(1000);
         std::fs::write(&file, format!("日本語テキスト\n{}\n", long_line)).unwrap();
 
-        let out = ReadFileTool
-            .execute(json!({ "path": file }))
-            .await
-            .unwrap();
+        let out = ReadFileTool.execute(json!({ "path": file })).await.unwrap();
 
         assert!(out.contains("1\t日本語テキスト"), "{}", out);
         assert!(out.contains("[line truncated]"), "{}", out);
@@ -786,7 +812,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_unreadable_subdir() {
+    #[cfg(unix)]
+    async fn list_directory_survives_unreadable_subdirectory() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("visible.txt"), "x").unwrap();
@@ -798,19 +825,46 @@ mod tests {
         let res = ListDirTool
             .execute(json!({ "path": dir.path().to_string_lossy(), "recursive": true }))
             .await;
+        // Restore before asserting so the TempDir can always clean itself up.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        panic!("PROBE result = {:?}", res);
+
+        let out = res.expect("one unreadable subdir must not fail the whole listing");
+        assert!(out.contains("[FILE] visible.txt"), "{}", out);
+        assert!(
+            out.contains("could not be read and were skipped"),
+            "{}",
+            out
+        );
     }
 
     #[tokio::test]
-    async fn probe_dev_zero_metadata() {
-        let m = std::fs::metadata("/dev/zero").unwrap();
-        panic!(
-            "PROBE /dev/zero is_dir={} is_file={} len={}",
-            m.is_dir(),
-            m.is_file(),
-            m.len()
-        );
+    #[cfg(unix)]
+    async fn read_rejects_non_regular_file() {
+        // /dev/zero reports len() == 0 and is neither a dir nor a regular file;
+        // slurping it would allocate until the process dies.
+        let err = ReadFileTool
+            .execute(json!({ "path": "/dev/zero" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversized_file() {
+        let dir = tempdir().unwrap();
+        let file = path_of(&dir, "huge.txt");
+        let f = std::fs::File::create(&file).unwrap();
+        // Sparse allocation: no bytes are actually written to disk.
+        f.set_len(MAX_READ_BYTES + 1).unwrap();
+        drop(f);
+
+        let err = ReadFileTool
+            .execute(json!({ "path": file }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "{}", err);
     }
 
     #[tokio::test]

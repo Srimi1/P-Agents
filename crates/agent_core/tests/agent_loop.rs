@@ -3,8 +3,8 @@
 //! stream, and the compaction hook.
 
 use agent_core::{
-    Agent, AgentEvent, AgentState, ChatMessage, HistoryCompactor, LlmResponse, MockProvider, Role,
-    TokenUsage, ToolCall, ToolDefinition, ToolDispatcher,
+    Agent, AgentEvent, AgentState, ChatMessage, HistoryCompactor, LlmProvider, LlmResponse,
+    LlmStream, MockProvider, Role, TokenUsage, ToolCall, ToolDefinition, ToolDispatcher,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -21,15 +21,19 @@ enum ToolOutcome {
 }
 
 struct ScriptedDispatcher {
-    tool_name: String,
+    tool_names: Vec<String>,
     outcome: ToolOutcome,
     calls: Mutex<Vec<(String, ToolCall)>>,
 }
 
 impl ScriptedDispatcher {
     fn replying(tool_name: &str, reply: &str) -> Self {
+        Self::replying_to(&[tool_name], reply)
+    }
+
+    fn replying_to(tool_names: &[&str], reply: &str) -> Self {
         Self {
-            tool_name: tool_name.to_string(),
+            tool_names: tool_names.iter().map(|n| n.to_string()).collect(),
             outcome: ToolOutcome::Reply(reply.to_string()),
             calls: Mutex::new(Vec::new()),
         }
@@ -37,7 +41,7 @@ impl ScriptedDispatcher {
 
     fn failing(tool_name: &str, message: &str) -> Self {
         Self {
-            tool_name: tool_name.to_string(),
+            tool_names: vec![tool_name.to_string()],
             outcome: ToolOutcome::Fail(message.to_string()),
             calls: Mutex::new(Vec::new()),
         }
@@ -55,11 +59,14 @@ impl ScriptedDispatcher {
 #[async_trait]
 impl ToolDispatcher for ScriptedDispatcher {
     fn get_definitions(&self) -> Vec<ToolDefinition> {
-        vec![ToolDefinition {
-            name: self.tool_name.clone(),
-            description: "scripted test tool".to_string(),
-            parameters: json!({"type": "object", "properties": {}}),
-        }]
+        self.tool_names
+            .iter()
+            .map(|name| ToolDefinition {
+                name: name.clone(),
+                description: "scripted test tool".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            })
+            .collect()
     }
 
     async fn dispatch(&self, agent_id: &str, tool_call: &ToolCall) -> Result<String> {
@@ -85,6 +92,51 @@ impl ToolDispatcher for NoTools {
 
     async fn dispatch(&self, _agent_id: &str, tool_call: &ToolCall) -> Result<String> {
         anyhow::bail!("unexpected dispatch of '{}'", tool_call.name)
+    }
+}
+
+/// Wraps `MockProvider` and records the tool schemas it was offered on each
+/// call. `MockProvider` discards that argument, so this is the only way to prove
+/// the loop actually advertises the dispatcher's tools to the model.
+struct ToolRecordingProvider {
+    inner: MockProvider,
+    offered: Mutex<Vec<Vec<String>>>,
+}
+
+impl ToolRecordingProvider {
+    fn new(inner: MockProvider) -> Self {
+        Self {
+            inner,
+            offered: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn offered(&self) -> Vec<Vec<String>> {
+        self.offered.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ToolRecordingProvider {
+    fn provider_name(&self) -> &str {
+        "tool-recording"
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        temperature: Option<f32>,
+    ) -> Result<LlmStream> {
+        self.offered
+            .lock()
+            .unwrap()
+            .push(tools.iter().map(|t| t.name.clone()).collect());
+        self.inner.stream(messages, tools, temperature).await
     }
 }
 
@@ -140,6 +192,24 @@ fn tool_call_turn(id: &str, name: &str, arguments: Value, usage: TokenUsage) -> 
             name: name.to_string(),
             arguments,
         }],
+        usage: Some(usage),
+        stop_reason: Some("tool_use".to_string()),
+    }
+}
+
+/// A single assistant turn carrying several tool calls, as parallel-tool-calling
+/// models emit.
+fn parallel_tool_call_turn(calls: &[(&str, &str, Value)], usage: TokenUsage) -> LlmResponse {
+    LlmResponse {
+        content: None,
+        tool_calls: calls
+            .iter()
+            .map(|(id, name, arguments)| ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.clone(),
+            })
+            .collect(),
         usage: Some(usage),
         stop_reason: Some("tool_use".to_string()),
     }
@@ -574,6 +644,198 @@ async fn non_streaming_mode_uses_the_unary_path() {
         ],
         "the unary path emits neither TextDelta nor StreamingResponse"
     );
+}
+
+#[tokio::test]
+async fn the_dispatchers_tools_are_advertised_on_every_turn() {
+    let provider = Arc::new(ToolRecordingProvider::new(MockProvider::new(vec![
+        tool_call_turn("call_a", "alpha", json!({"n": 1}), TokenUsage::new(7, 2)),
+        text_turn("Done.", TokenUsage::new(9, 2)),
+    ])));
+    let dispatcher = Arc::new(ScriptedDispatcher::replying_to(&["alpha", "beta"], "ok"));
+
+    let mut agent = Agent::new(AGENT_ID, "tester", "sys", provider.clone(), dispatcher);
+    assert_eq!(agent.run("go").await.unwrap(), "Done.");
+
+    // Both turns saw the full tool set; a loop that forgot to pass the
+    // definitions through would record empty vectors here.
+    assert_eq!(
+        provider.offered(),
+        vec![
+            vec!["alpha".to_string(), "beta".to_string()],
+            vec!["alpha".to_string(), "beta".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn provider_failure_aborts_the_run_and_marks_the_agent_errored() {
+    // An empty script makes the very first turn fail inside the provider.
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let mut agent = Agent::new(
+        AGENT_ID,
+        "tester",
+        "sys",
+        provider.clone(),
+        Arc::new(NoTools),
+    )
+    .with_events(tx);
+
+    let err = agent.run("anything").await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("script exhausted"),
+        "the provider's own error must surface, not be swallowed: {err}"
+    );
+    assert_eq!(agent.state, AgentState::Error);
+    assert_eq!(provider.call_count(), 1, "must not retry the failed turn");
+
+    // Nothing was appended after the user message: no phantom assistant turn.
+    assert_eq!(agent.history.len(), 2);
+    assert_eq!(agent.history[1].role, Role::User);
+
+    assert_eq!(
+        shape(&drain(&mut rx)),
+        vec![
+            "MessageAppended",
+            "StateChanged:Planning",
+            "StateChanged:StreamingResponse",
+            "StateChanged:Error",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_each_get_their_own_matching_observation() {
+    let provider = Arc::new(MockProvider::new(vec![
+        parallel_tool_call_turn(
+            &[
+                ("call_a", "alpha", json!({"n": 1})),
+                ("call_b", "beta", json!({"n": 2})),
+            ],
+            TokenUsage::new(11, 3),
+        ),
+        text_turn("Both done.", TokenUsage::new(21, 4)),
+    ]));
+    let dispatcher = Arc::new(ScriptedDispatcher::replying_to(&["alpha", "beta"], "ok"));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let mut agent = Agent::new(
+        AGENT_ID,
+        "tester",
+        "sys",
+        provider.clone(),
+        dispatcher.clone(),
+    )
+    .with_events(tx);
+    let answer = agent.run("do both").await.unwrap();
+    assert_eq!(answer, "Both done.");
+
+    // Both calls ran, in the order the model emitted them.
+    let calls = dispatcher.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1.id, "call_a");
+    assert_eq!(calls[1].1.id, "call_b");
+    assert_eq!(calls[1].1.arguments, json!({"n": 2}));
+
+    // system, user, assistant(2 tool_calls), tool(a), tool(b), assistant(final)
+    assert_eq!(agent.history.len(), 6);
+    assert_eq!(
+        agent.history[2]
+            .tool_calls
+            .as_ref()
+            .expect("both calls kept on one assistant turn")
+            .len(),
+        2
+    );
+    assert_eq!(agent.history[3].tool_call_id.as_deref(), Some("call_a"));
+    assert_eq!(agent.history[3].name.as_deref(), Some("alpha"));
+    assert_eq!(agent.history[4].tool_call_id.as_deref(), Some("call_b"));
+    assert_eq!(agent.history[4].name.as_deref(), Some("beta"));
+
+    // One start/finish pair per call, never interleaved.
+    assert_eq!(
+        shape(&drain(&mut rx)),
+        vec![
+            "MessageAppended",
+            "StateChanged:Planning",
+            "StateChanged:StreamingResponse",
+            "UsageReport",
+            "MessageAppended",
+            "StateChanged:ExecutingTool",
+            "ToolStarted",
+            "ToolFinished",
+            "MessageAppended",
+            "StateChanged:ExecutingTool",
+            "ToolStarted",
+            "ToolFinished",
+            "MessageAppended",
+            "StateChanged:Planning",
+            "StateChanged:StreamingResponse",
+            "TextDelta",
+            "UsageReport",
+            "MessageAppended",
+            "StateChanged:Completed",
+        ]
+    );
+
+    // The follow-up turn showed the model both observations.
+    let requests = provider.recorded_requests();
+    assert_eq!(requests[1].len(), 5);
+    assert_eq!(requests[1][3].role, Role::Tool);
+    assert_eq!(requests[1][4].role, Role::Tool);
+}
+
+#[tokio::test]
+async fn oversized_multibyte_tool_output_is_previewed_without_splitting_a_char() {
+    // Leading ASCII byte offsets the 3-byte chars so the preview cap lands
+    // mid-character; a naive `&s[..N]` here would panic.
+    let full_output = format!("x{}", "日".repeat(400));
+    assert_eq!(full_output.len(), 1201);
+
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_call_turn("call_dump_1", "dump", json!({}), TokenUsage::new(6, 2)),
+        text_turn("Got it.", TokenUsage::new(8, 2)),
+    ]));
+    let dispatcher = Arc::new(ScriptedDispatcher::replying("dump", &full_output));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let mut agent = Agent::new(AGENT_ID, "tester", "sys", provider, dispatcher).with_events(tx);
+    let answer = agent.run("dump it").await.unwrap();
+    assert_eq!(answer, "Got it.");
+
+    // History keeps the whole observation; only the event payload is capped.
+    assert_eq!(
+        agent.history[3].content.as_deref(),
+        Some(full_output.as_str())
+    );
+
+    let previews: Vec<String> = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolFinished { preview, .. } => Some(preview),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(previews.len(), 1);
+    let preview = &previews[0];
+    assert!(
+        preview.len() < full_output.len(),
+        "an oversized result must actually be truncated"
+    );
+    assert!(
+        full_output.starts_with(preview.as_str()),
+        "the preview must be a prefix of the real output"
+    );
+    // Cut back to a char boundary just under the byte cap, never mid-character.
+    assert!(
+        (200..=256).contains(&preview.len()),
+        "unexpected preview size: {}",
+        preview.len()
+    );
+    assert!(preview.ends_with('日'));
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ const DEFAULT_FIND_MAX_RESULTS: usize = 200;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 512;
 const BINARY_SNIFF_BYTES: usize = 8192;
+const TRUNCATED_LINE_MARKER: &str = "…[line truncated]";
 
 fn optional_str<'a>(args: &'a Value, key: &str, default: &'a str) -> Result<&'a str> {
     match args.get(key) {
@@ -55,20 +56,37 @@ fn compile_glob(pattern: &str, key: &str) -> Result<GlobMatcher> {
 
 fn walker(root: &Path) -> ignore::Walk {
     let mut builder = WalkBuilder::new(root);
-    // require_git(false) keeps .gitignore semantics outside a checkout; hidden(true) skips .git.
+    // Mirrors ListDirTool's walk so the three tools agree on what exists:
+    // dotfiles are searchable (.github, .env.example, .cargo/config.toml), only
+    // `.git` itself is pruned. `parents`/`git_global` are off so that results
+    // depend solely on the tree being searched, never on a .gitignore above the
+    // root or the user's global excludes file -- silent omissions are worse than
+    // extra hits for a search tool. require_git(false) keeps in-tree .gitignore
+    // files meaningful even when the tree is not a git checkout.
     builder
-        .hidden(true)
+        .hidden(false)
+        .parents(false)
+        .git_global(false)
         .git_ignore(true)
+        .git_exclude(true)
         .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .sort_by_file_path(|a, b| a.cmp(b));
     builder.build()
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    if rel.as_os_str().is_empty() {
+        // `root` is the file itself, so strip_prefix yields "". Fall back to the
+        // file name rather than emitting a nameless ":12: ..." line.
+        return match path.file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => path.to_string_lossy().to_string(),
+        };
+    }
+    rel.to_string_lossy().to_string()
 }
 
 /// Matches either the path relative to the search root or the bare file name, so that
@@ -92,16 +110,39 @@ fn resolve_root(path_str: &str) -> Result<PathBuf> {
 }
 
 fn read_text_file(path: &Path) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() > MAX_FILE_BYTES {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    // Fast path: skip huge files without reading them at all.
+    if file.metadata().ok()?.len() > MAX_FILE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    // Hard cap on the actual read as well. The metadata check above races with
+    // writers, so a file that grows between stat and read must not be able to
+    // pull an unbounded amount into memory. Reading one byte past the cap lets
+    // us detect (and drop) a file that outgrew its metadata.
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return None;
+    }
     let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
     if bytes[..sniff_len].contains(&0) {
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+/// Trims and length-caps a matched line, marking it when content was dropped so
+/// a truncated line is never mistaken for the file's real contents.
+fn format_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let capped = truncate_at_boundary(trimmed, MAX_LINE_BYTES);
+    if capped.len() == trimmed.len() {
+        capped.to_string()
+    } else {
+        format!("{}{}", capped, TRUNCATED_LINE_MARKER)
+    }
 }
 
 pub struct GrepSearchTool;
@@ -204,8 +245,7 @@ impl Tool for GrepSearchTool {
                         truncated = true;
                         break 'walk;
                     }
-                    let trimmed = truncate_at_boundary(line.trim(), MAX_LINE_BYTES);
-                    lines.push(format!("{}:{}: {}", rel, idx + 1, trimmed));
+                    lines.push(format!("{}:{}: {}", rel, idx + 1, format_line(line)));
                 }
             }
 
@@ -503,7 +543,11 @@ mod tests {
         let out = find(json!({ "pattern": "src/**/*.rs", "path": dir.path() }))
             .await
             .unwrap();
-        assert!(out.contains("src/deep/mod.rs"), "unexpected output: {}", out);
+        assert!(
+            out.contains("src/deep/mod.rs"),
+            "unexpected output: {}",
+            out
+        );
         assert!(!out.contains("root.rs"), "unexpected output: {}", out);
     }
 
@@ -547,45 +591,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_single_file_root() {
+    async fn grep_names_the_file_when_path_is_a_single_file() {
         let dir = fixture();
-        let f = dir.path().join("notes.txt");
-        let out = grep(json!({ "pattern": "needle", "path": f })).await.unwrap();
-        println!("SINGLE_FILE_ROOT_OUT=[{}]", out);
-        let out2 = grep(json!({ "pattern": "needle", "path": f, "include_glob": "*.txt" }))
+        let file = dir.path().join("notes.txt");
+        let out = grep(json!({ "pattern": "needle", "path": file }))
             .await
             .unwrap();
-        println!("SINGLE_FILE_ROOT_GLOB_OUT=[{}]", out2);
-        let out3 = find(json!({ "pattern": "*.txt", "path": f })).await.unwrap();
-        println!("SINGLE_FILE_FIND_OUT=[{}]", out3);
+        assert_eq!(out, "notes.txt:1: plain needle text");
     }
 
     #[tokio::test]
-    async fn probe_long_line_and_symlink() {
-        let dir = TempDir::new().unwrap();
-        let long: String = "x".repeat(600) + "needle";
-        write(dir.path(), "long.txt", &long);
-        let out = grep(json!({ "pattern": "x", "path": dir.path() })).await.unwrap();
-        println!("LONG_LEN={} ENDS={:?}", out.len(), &out[out.len().saturating_sub(20)..]);
-
-        write(dir.path(), "real/target.txt", "needle here\n");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.path().join("real/target.txt"), dir.path().join("link.txt"))
-            .unwrap();
-        let out2 = grep(json!({ "pattern": "needle", "path": dir.path() })).await.unwrap();
-        println!("SYMLINK_OUT=[{}]", out2);
-    }
-
-    #[tokio::test]
-    async fn probe_empty_glob_and_dotfile() {
+    async fn find_names_the_file_when_path_is_a_single_file() {
         let dir = fixture();
-        write(dir.path(), ".env", "needle secret\n");
-        let out = grep(json!({ "pattern": "needle", "path": dir.path() })).await.unwrap();
-        println!("DOTFILE_OUT=[{}]", out);
-        let out2 = grep(json!({ "pattern": "needle", "path": dir.path(), "include_glob": "" })).await;
-        println!("EMPTY_GLOB={:?}", out2.map_err(|e| e.to_string()));
-        let out3 = grep(json!({ "pattern": "needle", "path": dir.path(), "include_glob": 5 })).await;
-        println!("NUM_GLOB={:?}", out3.map_err(|e| e.to_string()));
+        let file = dir.path().join("notes.txt");
+        let out = find(json!({ "pattern": "*.txt", "path": file }))
+            .await
+            .unwrap();
+        assert_eq!(out, "notes.txt");
+    }
+
+    #[tokio::test]
+    async fn search_sees_dotfiles_but_never_descends_into_dot_git() {
+        let dir = fixture();
+        write(dir.path(), ".env.example", "needle in a dotfile\n");
+        write(
+            dir.path(),
+            ".github/workflows/ci.yml",
+            "needle in a dot dir\n",
+        );
+        write(
+            dir.path(),
+            ".git/objects/blob",
+            "needle inside the git dir\n",
+        );
+
+        let out = grep(json!({ "pattern": "needle", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(".env.example:1: needle in a dotfile"),
+            "dotfiles must be searchable: {}",
+            out
+        );
+        assert!(
+            out.contains(".github/workflows/ci.yml:1: needle in a dot dir"),
+            "dot directories must be searchable: {}",
+            out
+        );
+        assert!(!out.contains(".git/objects"), "must skip .git: {}", out);
+
+        let listed = find(json!({ "pattern": "**/*", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert!(listed.contains(".env.example"), "unexpected: {}", listed);
+        assert!(!listed.contains(".git/objects"), "unexpected: {}", listed);
+    }
+
+    #[tokio::test]
+    async fn gitignore_outside_the_search_root_does_not_hide_results() {
+        // A .gitignore in a *parent* of the search root must not silently drop matches,
+        // otherwise results depend on state the caller never asked about.
+        let outer = TempDir::new().unwrap();
+        write(outer.path(), ".gitignore", "notes.txt\n");
+        let inner = outer.path().join("project");
+        write(&inner, "notes.txt", "needle text\n");
+
+        let out = grep(json!({ "pattern": "needle", "path": inner }))
+            .await
+            .unwrap();
+        assert_eq!(out, "notes.txt:1: needle text");
+    }
+
+    #[tokio::test]
+    async fn grep_marks_lines_it_had_to_truncate() {
+        let dir = TempDir::new().unwrap();
+        let long = format!("needle {}", "x".repeat(MAX_LINE_BYTES + 100));
+        write(dir.path(), "long.txt", &long);
+
+        let out = grep(json!({ "pattern": "needle", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert!(
+            out.starts_with("long.txt:1: needle "),
+            "unexpected: {}",
+            out
+        );
+        assert!(
+            out.ends_with(TRUNCATED_LINE_MARKER),
+            "truncated lines must be marked: {}",
+            &out[out.len() - 40..]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_does_not_mark_lines_that_fit() {
+        let dir = fixture();
+        let out = grep(json!({ "pattern": "needle", "path": dir.path() }))
+            .await
+            .unwrap();
+        assert!(!out.contains(TRUNCATED_LINE_MARKER), "unexpected: {}", out);
     }
 
     #[tokio::test]

@@ -182,8 +182,15 @@ fn tool_call_to_wire(tool_call: &ToolCall) -> Value {
         // A model that produced unparseable arguments leaves `Null` behind; an
         // empty object is the only thing the server will accept back.
         Value::Null => "{}".to_string(),
-        // Already-encoded arguments must not be encoded a second time.
-        Value::String(raw) => raw.clone(),
+        // An empty argument blob is only meaningful to the server as `{}`.
+        Value::String(raw) if raw.trim().is_empty() => "{}".to_string(),
+        Value::String(raw) if is_encoded_json_document(raw) => {
+            // Already-encoded arguments must not be encoded a second time.
+            raw.clone()
+        }
+        // Anything else (including a bare scalar string, which is NOT a valid
+        // encoded argument document) is encoded now, so the field we send is
+        // always parseable JSON text.
         other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
     };
     json!({
@@ -194,6 +201,25 @@ fn tool_call_to_wire(tool_call: &ToolCall) -> Value {
             "arguments": arguments,
         }
     })
+}
+
+/// True when `raw` is already the encoded form of a JSON object or array, i.e.
+/// something the server will accept verbatim as a tool-call `arguments` string.
+fn is_encoded_json_document(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw).is_ok_and(|v| v.is_object() || v.is_array())
+}
+
+/// Normalises a wire `arguments` value into the argument text it represents.
+///
+/// The OpenAI schema says this is a string, but several compatible servers
+/// (llama.cpp, some LocalAI builds) send the object itself. Serialising it is
+/// strictly better than dropping it and dispatching the tool with no arguments.
+fn arguments_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => Some(raw.clone()),
+        Value::Null => None,
+        other => serde_json::to_string(other).ok(),
+    }
 }
 
 fn tools_to_wire(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -339,13 +365,13 @@ fn handle_sse_message(data: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
                     }
                     if let Some(fragment) = function
                         .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
+                        .and_then(arguments_text)
                     {
                         if !fragment.is_empty() {
-                            acc.push_tool_args(index, fragment);
+                            acc.push_tool_args(index, &fragment);
                             events.push(StreamEvent::ToolCallArgsDelta {
                                 index,
-                                json_fragment: fragment.to_string(),
+                                json_fragment: fragment,
                             });
                         }
                     }
@@ -378,11 +404,13 @@ fn parse_usage(usage: &Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         prompt_tokens,
         completion_tokens,
+        // Saturating, and only evaluated when `total_tokens` is absent: a server
+        // reporting absurd counts must not abort the turn with an overflow panic.
         total_tokens: usage
             .get("total_tokens")
             .and_then(Value::as_u64)
             .map(|t| t as usize)
-            .unwrap_or(prompt_tokens + completion_tokens),
+            .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens)),
     })
 }
 
@@ -418,12 +446,12 @@ fn parse_completion_body(body: &Value) -> Result<LlmResponse> {
                 .to_string();
             let raw_arguments = function
                 .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
+                .and_then(arguments_text)
                 .unwrap_or_default();
             let arguments = if raw_arguments.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(raw_arguments).unwrap_or(Value::Null)
+                serde_json::from_str(&raw_arguments).unwrap_or(Value::Null)
             };
             let id = raw
                 .get("id")
@@ -515,7 +543,11 @@ mod tests {
 
     #[test]
     fn tool_response_becomes_role_tool_with_tool_call_id() {
-        let messages = vec![ChatMessage::tool_response("call_1", "read_file", "fn main()")];
+        let messages = vec![ChatMessage::tool_response(
+            "call_1",
+            "read_file",
+            "fn main()",
+        )];
         assert_eq!(
             to_wire(&messages)[0],
             json!({
@@ -555,7 +587,10 @@ mod tests {
             name: "t".to_string(),
             arguments: Value::String("{\"a\":1}".to_string()),
         };
-        assert_eq!(tool_call_to_wire(&call)["function"]["arguments"], "{\"a\":1}");
+        assert_eq!(
+            tool_call_to_wire(&call)["function"]["arguments"],
+            "{\"a\":1}"
+        );
     }
 
     #[test]
@@ -599,7 +634,10 @@ mod tests {
         let unary = provider.build_body(&[ChatMessage::user("hi")], &[], None, false);
         assert!(unary.get("stream").is_none());
         assert!(unary.get("temperature").is_none());
-        assert_eq!(provider.endpoint(), "http://localhost:11434/v1/chat/completions");
+        assert_eq!(
+            provider.endpoint(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     #[tokio::test]
@@ -627,7 +665,11 @@ mod tests {
                 Some("héllo 世界 👍"),
                 "chunk size {size}"
             );
-            assert_eq!(done.stop_reason.as_deref(), Some("stop"), "chunk size {size}");
+            assert_eq!(
+                done.stop_reason.as_deref(),
+                Some("stop"),
+                "chunk size {size}"
+            );
             let usage = done.usage.expect("usage");
             assert_eq!(usage.prompt_tokens, 11);
             assert_eq!(usage.total_tokens, 15);
@@ -800,6 +842,72 @@ mod tests {
             StreamEvent::ToolCallStarted { index: 0, .. }
         ));
         assert_eq!(acc.finish().tool_calls[0].name, "t");
+    }
+
+    #[test]
+    fn absurd_token_counts_do_not_panic() {
+        // A hostile or buggy endpoint must not be able to abort the turn with an
+        // arithmetic overflow (which panics in debug builds).
+        let usage = parse_usage(&json!({
+            "prompt_tokens": u64::MAX,
+            "completion_tokens": u64::MAX,
+            "total_tokens": 3
+        }))
+        .unwrap();
+        assert_eq!(usage.total_tokens, 3);
+        let summed =
+            parse_usage(&json!({"prompt_tokens": u64::MAX, "completion_tokens": u64::MAX}))
+                .unwrap();
+        assert_eq!(summed.total_tokens, usize::MAX);
+    }
+
+    #[test]
+    fn object_arguments_are_preserved_not_silently_dropped() {
+        // llama.cpp/LocalAI-style servers sometimes send `arguments` as an
+        // object. Dropping it would dispatch the tool with no arguments at all.
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "function": {"name": "write", "arguments": {"path": "a.txt"}}
+                    }]
+                }
+            }]
+        });
+        let resp = parse_completion_body(&body).unwrap();
+        assert_eq!(resp.tool_calls[0].arguments["path"], "a.txt");
+    }
+
+    #[test]
+    fn object_arguments_in_a_stream_are_preserved() {
+        let mut acc = StreamAccumulator::new();
+        let data = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"t","arguments":{"k":7}}}]}}]}"#;
+        handle_sse_message(data, &mut acc).unwrap();
+        assert_eq!(acc.finish().tool_calls[0].arguments["k"], 7);
+    }
+
+    #[test]
+    fn string_arguments_that_are_not_an_object_are_re_encoded() {
+        // `arguments` on the wire must always be a JSON *document*. A bare
+        // scalar string must be re-encoded, not passed through as raw text.
+        let call = ToolCall {
+            id: "c".to_string(),
+            name: "t".to_string(),
+            arguments: Value::String("hello".to_string()),
+        };
+        let wire = tool_call_to_wire(&call);
+        let raw = wire["function"]["arguments"].as_str().unwrap();
+        serde_json::from_str::<Value>(raw).expect("arguments must be valid JSON text");
+        assert_eq!(raw, "\"hello\"");
+
+        let empty = ToolCall {
+            id: "c".to_string(),
+            name: "t".to_string(),
+            arguments: Value::String("   ".to_string()),
+        };
+        assert_eq!(tool_call_to_wire(&empty)["function"]["arguments"], "{}");
     }
 
     #[test]

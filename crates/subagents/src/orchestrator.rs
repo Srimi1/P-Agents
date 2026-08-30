@@ -156,7 +156,8 @@ impl MultiAgentOrchestrator {
             dispatcher,
             vec![
                 Arc::new(SpawnSubAgentTool::new(Arc::clone(&factory))) as Arc<dyn Tool>,
-                Arc::new(RunParallelSubAgentsTool::new(factory, self.max_parallel)) as Arc<dyn Tool>,
+                Arc::new(RunParallelSubAgentsTool::new(factory, self.max_parallel))
+                    as Arc<dyn Tool>,
             ],
         ));
 

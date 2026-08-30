@@ -2,8 +2,8 @@ use crate::compaction::HistoryCompactor;
 use crate::events::{emit, AgentEvent, EventSink};
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::types::{
-    truncate_at_boundary, AgentState, ChatMessage, LlmResponse, ToolCall, ToolDefinition,
-    TokenUsage,
+    truncate_at_boundary, AgentState, ChatMessage, LlmResponse, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -291,17 +291,20 @@ impl Agent {
                     },
                 );
 
-                let (observation, is_error) =
-                    match self.dispatcher.dispatch(&self.id, tool_call).await {
-                        Ok(res) => (res, false),
-                        Err(err) => {
-                            warn!(tool = %tool_call.name, error = %err, "Tool execution returned error");
-                            (
-                                format!("Error executing tool '{}': {}", tool_call.name, err),
-                                true,
-                            )
-                        }
-                    };
+                let (observation, is_error) = match self
+                    .dispatcher
+                    .dispatch(&self.id, tool_call)
+                    .await
+                {
+                    Ok(res) => (res, false),
+                    Err(err) => {
+                        warn!(tool = %tool_call.name, error = %err, "Tool execution returned error");
+                        (
+                            format!("Error executing tool '{}': {}", tool_call.name, err),
+                            true,
+                        )
+                    }
+                };
 
                 emit(
                     &self.events,
