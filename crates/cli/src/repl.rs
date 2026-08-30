@@ -1,16 +1,21 @@
+use agent_core::ToolDispatcher;
 use anyhow::Result;
 use colored::*;
 use std::io::{self, Write};
+use std::sync::Arc;
 use subagents::MultiAgentOrchestrator;
 
-pub async fn start_interactive_repl(orchestrator: MultiAgentOrchestrator) -> Result<()> {
+pub async fn start_interactive_repl(
+    orchestrator: MultiAgentOrchestrator,
+    dispatcher: Arc<dyn ToolDispatcher>,
+) -> Result<()> {
     println!("{}", "=========================================================".cyan());
     println!("{}", "🚀 Universal Rust Multi-Agent Harness Initialized!".bold().green());
     println!("{}", "Personas active: Planner, Engineer, Verifier, Critic, Researcher, Analyst".yellow());
     println!("{}", "Type your goal or prompt below (or 'exit' to quit):".cyan());
     println!("{}", "=========================================================\n".cyan());
 
-    let mut lead_agent = orchestrator.create_lead_agent()?;
+    let mut lead_agent = orchestrator.create_lead_agent(dispatcher, None, None)?;
 
     loop {
         print!("{}", "harness> ".bold().blue());

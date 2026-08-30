@@ -1,0 +1,60 @@
+# Universal Multi-Agent Harness — configuration template.
+#
+# Copy to ~/.config/harness/config.toml and edit. Every value below is the
+# built-in default, so an empty file behaves identically to this one.
+#
+# Precedence, lowest to highest:
+#   these defaults  ->  config.toml  ->  environment  ->  CLI flags
+#
+# Environment overrides use a HARNESS_ prefix and __ between levels, e.g.
+#   HARNESS_PROVIDER__DEFAULT=openai
+#   HARNESS_LIMITS__MAX_ITERATIONS=40
+#   HARNESS_PERMISSIONS__YOLO=true
+# The legacy LLM_BASE_URL and LLM_MODEL variables still override the OpenAI
+# provider's settings.
+
+[provider]
+# Which provider to use when --provider is not passed: "anthropic" or "openai".
+default = "anthropic"
+
+[provider.anthropic]
+model = "claude-sonnet-5"
+base_url = "https://api.anthropic.com"
+# Anthropic requires an explicit output cap on every request.
+max_tokens = 8192
+# Prefer the ANTHROPIC_API_KEY environment variable. A key set here works but
+# logs a warning, because config files get committed by accident.
+# api_key = "sk-ant-..."
+
+[provider.openai]
+# Also covers Ollama, vLLM, LocalAI, DeepSeek, and Gemini's OpenAI-compatible
+# endpoint — point base_url at the server and use its model names.
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+# api_key = "sk-..."
+
+[limits]
+# Maximum reason/act cycles before an agent gives up on a single request.
+max_iterations = 20
+# Compaction kicks in as the conversation approaches this many prompt tokens.
+max_context_tokens = 128000
+# Ceiling on concurrent sub-agents for run_parallel_subagents.
+max_parallel_subagents = 4
+
+[permissions]
+# Tools that never prompt, even if they declare that they need approval.
+auto_approve = ["read_file", "list_directory", "grep_search", "find_files_by_name"]
+# Approve every tool call without asking. Intended for CI and scripted runs —
+# this lets agents write files and run shell commands unsupervised.
+yolo = false
+
+# Extra personas are merged into the roles spawn_subagent accepts, alongside the
+# six built-ins (planner, engineer, verifier, critic, researcher, analyst).
+# Reusing a built-in name replaces its prompt.
+#
+# [personas.dba]
+# display_name = "DatabaseExpert"
+# prompt = """
+# You are a database specialist. Review schemas and queries for correctness,
+# index coverage, and lock contention. Quote EXPLAIN output when you have it.
+# """
