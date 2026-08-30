@@ -20,7 +20,7 @@ struct CliArgs {
     )]
     prompt: Option<String>,
 
-    #[arg(long, help = "Provider to use: anthropic, openai, or mock")]
+    #[arg(long, help = "Provider to use: anthropic, openai, gemini, or mock")]
     provider: Option<String>,
 
     #[arg(long, help = "Model name, overriding the configured default")]
