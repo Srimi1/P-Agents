@@ -43,8 +43,8 @@ execution, and a replayable transcript of everything that happened.
 ```text
 crates/
 ├── agent_core/      LlmProvider trait, streaming ReAct loop, event and compaction hooks
-│   └── providers/   anthropic, openai, mock
-├── harness_core/    Tool trait and registry, filesystem/search/terminal tools, context manager
+│   └── providers/   anthropic, openai (also serves Gemini and local servers), mock
+├── harness_core/    Tool trait and registry, file/search/terminal/pty tools, path containment
 ├── subagents/       Personas, delegation tools, orchestrator
 ├── runtime/         Event bus, approval gate, gated dispatcher, JSONL sessions
 └── cli/             Config, provider factory, app assembly, streaming REPL
