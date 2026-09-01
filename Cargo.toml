@@ -42,7 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 colored = "2.1"
-config = "0.14"
+config = "0.15"
 ignore = "0.4"
 regex = "1.10"
 
