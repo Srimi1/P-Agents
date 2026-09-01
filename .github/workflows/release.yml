@@ -60,7 +60,7 @@ jobs:
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
           ls -lh "$STAGE.tar.gz"*
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: harness-${{ matrix.target }}
           path: |
