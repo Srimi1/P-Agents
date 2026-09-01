@@ -1,0 +1,6 @@
+# CODEOWNERS — reviewers are requested automatically on PRs.
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*               @Srimi1
+/.github/       @Srimi1
+/crates/        @Srimi1

@@ -1,0 +1,25 @@
+name: Audit
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"  # Mondays 07:00 UTC, same as Dependabot
+  workflow_dispatch:
+  push:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+
+permissions:
+  contents: read
+  issues: write  # to file an issue on failure if you wire it later
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,7 +1,11 @@
 # P-Agents — Universal Multi-Agent Harness (Rust)
 
 [![CI](https://github.com/Srimi1/P-Agents/actions/workflows/ci.yml/badge.svg)](https://github.com/Srimi1/P-Agents/actions/workflows/ci.yml)
+[![Release](https://github.com/Srimi1/P-Agents/actions/workflows/release.yml/badge.svg)](https://github.com/Srimi1/P-Agents/actions/workflows/release.yml)
+[![Audit](https://github.com/Srimi1/P-Agents/actions/workflows/audit.yml/badge.svg)](https://github.com/Srimi1/P-Agents/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](rust-toolchain.toml)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 > Creating and learning to create agents and subagents in a harness, step by step.
 > Be ready to watch my journey.
@@ -233,9 +237,26 @@ cargo fmt --all --check
 ./scripts/e2e.sh
 ```
 
-CI runs all of the above on Linux and macOS for every push and pull request.
+CI runs all of the above on Linux and macOS for every push and pull request, plus `cargo audit` on advisories.
 
 `scripts/e2e.sh` runs the full gate: build, tests, clippy, an offline one-shot
 run that asserts the artifact and session log, and a scripted REPL session that
 exercises the approval prompt and denial recovery. If `ANTHROPIC_API_KEY` is
 set it finishes with one live single-turn call.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor guide, branch naming and commit conventions.
+
+## Contributing & Community
+
+* **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, coding standards, PR checklist.
+* **Code of Conduct:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) (Contributor Covenant 2.1).
+* **Security:** [SECURITY.md](SECURITY.md) — how to report vulnerabilities privately.
+* **Support:** [SUPPORT.md](SUPPORT.md) · [Discussions](https://github.com/Srimi1/P-Agents/discussions) · [Issues](https://github.com/Srimi1/P-Agents/issues)
+
+## Changelog
+
+Releases are cut from tags `v*.*.*` via [`.github/workflows/release.yml`](.github/workflows/release.yml) — each tag builds `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin` tarballs with SHA256 and a generated GitHub Release. See [Releases](https://github.com/Srimi1/P-Agents/releases) for notes.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

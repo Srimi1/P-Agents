@@ -13,7 +13,14 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Srimi1/P-Agents"
+homepage = "https://github.com/Srimi1/P-Agents"
+readme = "README.md"
 description = "A model-agnostic AI agent harness and multi-agent orchestrator"
+keywords = ["agent", "ai", "llm", "orchestrator", "react"]
+categories = ["command-line-utilities", "asynchronous"]
+authors = ["Srijan Saanand <srimi.dev@gmail.com>"]
+rust-version = "1.75"
+exclude = [".harness/", ".github/", "target/"]
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }

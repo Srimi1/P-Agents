@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "💬 Discussions — questions, ideas, show & tell"
+    url: https://github.com/Srimi1/P-Agents/discussions
+    about: "Prefer discussions for open-ended questions."
+  - name: "🔒 Report a security vulnerability"
+    url: https://github.com/Srimi1/P-Agents/security/advisories/new
+    about: "Please don't file public issues for sensitive security reports. See SECURITY.md."

@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Interactive multi-agent harness CLI"
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Interactive multi-agent harness CLI — binary `harness`"
 
 [lib]
 name = "cli"

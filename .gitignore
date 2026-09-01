@@ -1,5 +1,17 @@
 /target
 .harness/
 .env
+*.env
 *.log
 .DS_Store
+.coverage/
+lcov.info
+*.profraw
+*.profdata
+.fleet/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.env.local

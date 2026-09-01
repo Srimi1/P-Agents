@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability for P-Agents
+title: "feat: [short description]"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What job can't you do today? Who benefits?
+      placeholder: "As a harness operator I want ... so that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Desired behavior, API/CLI shape, alternatives considered
+      placeholder: |
+        Proposed CLI: `harness --resume <id> --export markdown`
+        Alternatives: ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: ["agent_core / providers", "harness_core / tools", "subagents / personas", "runtime / sessions", "cli / REPL / config", "docs / DX", "CI / release", "other"]
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      placeholder: "Links, sketches, related issues"
+    validations:
+      required: false
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to open a PR for this (with guidance)
+          required: false

@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible bug in P-Agents
+title: "fix: [short description]"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Fill this out so we can reproduce quickly.
+        Security-sensitive? Use SECURITY.md instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Tag, or `git rev-parse --short HEAD` on main
+      placeholder: "0.1.0 or e45e27f"
+    validations:
+      required: true
+  - type: input
+    id: toolchain
+    attributes:
+      label: Toolchain
+      description: Output of `rustc --version` and `cargo --version`, plus OS
+      placeholder: "rustc 1.78.0, macOS 14, cargo 1.78"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options: ["mock (offline)", "anthropic", "openai", "gemini (compat)", "other / local (ollama, vLLM)"]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal commands + config. Include prompt/flags used.
+      placeholder: |
+        1. cargo run -p cli -- --mock --prompt "Create the artifact file"
+        2. observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "What should have happened?"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior + logs
+      description: Paste `RUST_BACKTRACE=1` output, relevant `.harness/sessions/*.jsonl` snippet (redact keys)
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran `cargo test --workspace` and `cargo clippy -- -D warnings` locally
+          required: false
+        - label: I searched existing issues and didn't find a duplicate
+          required: true

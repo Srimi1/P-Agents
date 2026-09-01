@@ -1,0 +1,12 @@
+# Linguist overrides — keep GitHub language stats focused on Rust
+Cargo.lock linguist-vendored
+*.jsonl linguist-vendored
+
+# Normalize line endings
+* text=auto eol=lf
+*.rs text diff=rust
+*.toml text
+*.md text
+*.yml text
+*.yaml text
+*.sh text eol=lf

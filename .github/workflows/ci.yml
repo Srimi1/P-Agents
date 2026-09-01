@@ -6,31 +6,41 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Cancel redundant runs on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege for GITHUB_TOKEN (see https://docs.github.com/en/actions/security-guides/automatic-token-authentication)
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  # A failure here should be a real failure, not a flake from a slow runner.
   RUST_BACKTRACE: 1
 
 jobs:
   check:
-    name: test (${{ matrix.os }})
+    name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
-      # One platform failing should not hide the other's result.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      # rust-toolchain.toml pins the channel and pulls in clippy and rustfmt,
-      # so the runner's preinstalled rustup provisions everything on first use.
       - name: Show toolchain
         run: |
           rustup show
           cargo --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -39,18 +49,33 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
   e2e:
     name: end-to-end
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [check]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: Swatinem/rust-cache@v2
 
-      # Builds release, runs the suite, then drives the real binary against the
-      # scripted offline provider: one-shot run, session transcript, and a REPL
-      # session that must show the approval prompt and recover from a denial.
       - name: End-to-end gate
         run: ./scripts/e2e.sh
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Don't block PRs on advisory DB flake, but surface it visibly.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
